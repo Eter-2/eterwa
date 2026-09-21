@@ -6,7 +6,13 @@
 // whether the account is on OpenAI or Anthropic.
 // ============================================================
 
-export type AiProvider = 'openai' | 'anthropic'
+/**
+ * 'claude-agent-sdk' is the Eter subscription path (see
+ * providers/claude-agent-sdk.ts): authenticated with the service's own
+ * `CLAUDE_CODE_OAUTH_TOKEN`, never a per-account `api_key`. 'openai' /
+ * 'anthropic' stay exactly as they were — bring-your-own-key, unchanged.
+ */
+export type AiProvider = 'openai' | 'anthropic' | 'claude-agent-sdk'
 
 /**
  * Account AI setup, decrypted and ready to use. Produced by
@@ -29,6 +35,92 @@ export interface AiConfig {
    *  knowledge base is embedded and semantic retrieval turns on; when
    *  null, retrieval falls back to lexical full-text search. */
   embeddingsApiKey: string | null
+  /**
+   * Bloco 3-A — commercial mode for Meta Click-to-WhatsApp ad leads.
+   * All four are optional so the many ad-hoc `AiConfig` literals built
+   * for the "test key" endpoint and unit tests don't need to know about
+   * this feature; `loadAiConfig` always populates them from the row.
+   * See src/lib/ai/commercial.ts for the gating logic that reads them.
+   */
+  /** Master switch for the commercial persona, independent of (but
+   *  still gated behind) `autoReplyEnabled`. */
+  commercialModeEnabled?: boolean
+  /** Business context for the commercial persona (mirrors `systemPrompt`
+   *  for the normal persona). The commercial persona only activates
+   *  when this is a non-empty string. */
+  commercialSystemPrompt?: string | null
+  /** Scheduling link handed to a qualified lead. When null, the agent
+   *  asks for the lead's email and says the team will follow up —
+   *  never invents a link. */
+  commercialBookingUrl?: string | null
+  /** First message sent immediately (before any AI generation) on a
+   *  commercial conversation's first inbound message, to keep the 24h
+   *  WhatsApp session window open. Falls back to
+   *  DEFAULT_COMMERCIAL_WELCOME_MESSAGE when null/empty. */
+  commercialWelcomeMessage?: string | null
+  /** Non-null only when the account has a commercial leads calendar
+   *  configured (migration 046) — used purely as a prompt-building
+   *  signal (buildSystemPrompt's `commercialCalendarConfigured`) so the
+   *  model is told to actually book via tools vs. fall back to the
+   *  link/email flow. The full scheduling config (busy calendars,
+   *  business hours, etc.) is loaded separately by
+   *  getCommercialCalendarConfig when a tool call actually runs. */
+  commercialCalendarId?: string | null
+  /**
+   * Números de telefone da equipa (formato internacional, comparados
+   * com `normalizePhone` — ver src/lib/whatsapp/phone-utils.ts) que
+   * apanham SEMPRE o assistente interno (`systemPrompt`), nunca o modo
+   * comercial, mesmo com `commercialModeEnabled` ligado. Vazio (o valor
+   * por omissão) significa que toda a gente apanha o modo comercial —
+   * ver isCommercialConversation em src/lib/ai/commercial.ts.
+   */
+  teamPhoneNumbers?: string[]
+  /**
+   * Mensagem enviada ao utilizador ANTES de a IA se calar e passar a
+   * conversa para a equipa (handoff), em qualquer dos dois modos. Nulo
+   * usa DEFAULT_HANDOFF_MESSAGE (src/lib/ai/handoff.ts).
+   */
+  handoffMessage?: string | null
+  /**
+   * Regra do Ricardo (migração 050): no modo comercial, um handoff sem
+   * nome, email e motivo registados é BLOQUEADO em código (ver
+   * src/lib/ai/commercial-handoff.ts), não só no prompt. Esta é a
+   * válvula de escape — quantas tentativas bloqueadas SEGUIDAS na
+   * mesma conversa antes de deixar passar de qualquer forma (marcando
+   * `conversations.handoff_incomplete = true`), para nunca prender
+   * alguém irritado a repetir dados que não quer dar. Undefined/null
+   * cai no DEFAULT_MAX_HANDOFF_BLOCKED_ATTEMPTS (2).
+   */
+  maxHandoffBlockedAttempts?: number | null
+
+  /**
+   * Migração 053 — números E.164 que recebem aviso automático por
+   * WhatsApp em dois eventos do modo comercial: handoff para a equipa
+   * (team_requested_at) e reunião marcada (book_commercial_meeting).
+   * Ver src/lib/notifications/notify-team.ts. Vazio por omissão: sem
+   * números configurados, o aviso por WhatsApp simplesmente não
+   * dispara (o aviso por Mattermost continua independente disto).
+   */
+  notifyPhoneNumbers?: string[]
+
+  /**
+   * Migração 054 — máximo de mensagens por minuto de UM número antes
+   * de a IA deixar de responder a esse número (a mensagem continua a
+   * ser guardada normalmente). Isento: teamPhoneNumbers e
+   * notifyPhoneNumbers. Undefined/null cai no valor por omissão (10)
+   * — ver DEFAULT_RATE_LIMIT_MESSAGES_PER_MINUTE em
+   * src/lib/ai/inbound-rate-limit.ts.
+   */
+  rateLimitMessagesPerMinute?: number | null
+  /**
+   * Migração 054 — máximo de números NOVOS distintos por hora, para
+   * toda a conta, antes de a IA deixar de responder aos seguintes
+   * números novos (protege contra inundação com números diferentes).
+   * Undefined/null cai no valor por omissão (60) — ver
+   * DEFAULT_RATE_LIMIT_NEW_NUMBERS_PER_HOUR em
+   * src/lib/ai/inbound-rate-limit.ts.
+   */
+  rateLimitNewNumbersPerHour?: number | null
 }
 
 /** A single conversation turn in the shape both providers accept. */

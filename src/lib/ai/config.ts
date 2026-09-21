@@ -3,19 +3,32 @@ import { decrypt } from '@/lib/whatsapp/encryption'
 import type { AiConfig } from './types'
 
 interface AiConfigRow {
-  provider: 'openai' | 'anthropic'
+  provider: 'openai' | 'anthropic' | 'claude-agent-sdk'
   model: string
-  api_key: string
+  // Nullable: 'claude-agent-sdk' accounts have no per-account key at
+  // all — see migration 047_claude_agent_sdk_provider.sql.
+  api_key: string | null
   system_prompt: string | null
   is_active: boolean
   auto_reply_enabled: boolean
   auto_reply_max_per_conversation: number
   handoff_agent_id: string | null
   embeddings_api_key: string | null
+  commercial_system_prompt: string | null
+  commercial_mode_enabled: boolean
+  commercial_booking_url: string | null
+  commercial_welcome_message: string | null
+  commercial_calendar_id: string | null
+  team_phone_numbers: string[] | null
+  handoff_message: string | null
+  max_handoff_blocked_attempts: number | null
+  notify_phone_numbers: string[] | null
+  rate_limit_messages_per_minute: number | null
+  rate_limit_new_numbers_per_hour: number | null
 }
 
 const CONFIG_COLUMNS =
-  'provider, model, api_key, system_prompt, is_active, auto_reply_enabled, auto_reply_max_per_conversation, handoff_agent_id, embeddings_api_key'
+  'provider, model, api_key, system_prompt, is_active, auto_reply_enabled, auto_reply_max_per_conversation, handoff_agent_id, embeddings_api_key, commercial_system_prompt, commercial_mode_enabled, commercial_booking_url, commercial_welcome_message, commercial_calendar_id, team_phone_numbers, handoff_message, max_handoff_blocked_attempts, notify_phone_numbers, rate_limit_messages_per_minute, rate_limit_new_numbers_per_hour'
 
 /**
  * Load and decrypt the account's AI config for *use* (draft or
@@ -47,10 +60,14 @@ export async function loadAiConfig(
   // The Playground passes requireActive:false so an admin can test the
   // agent before flipping the master switch on.
   if (requireActive && !row.is_active) return null
-  // Defensive: the column is NOT NULL, but a partial write / manual DB
-  // edit could leave it empty. Treat a missing key as "not configured"
-  // rather than letting decrypt() throw on null.
-  if (!row.api_key) return null
+  // Defensive: for 'openai'/'anthropic' the column is effectively
+  // required (BYO key) — a partial write / manual DB edit leaving it
+  // empty means "not configured", same as before. 'claude-agent-sdk'
+  // never has a per-account key at all (it authenticates with the
+  // service's own CLAUDE_CODE_OAUTH_TOKEN — see
+  // providers/claude-agent-sdk.ts), so a null key there is the normal,
+  // expected shape, not a broken config.
+  if (row.provider !== 'claude-agent-sdk' && !row.api_key) return null
 
   // The embeddings key is optional and independent of the chat key —
   // a corrupt/undecryptable one should downgrade to lexical KB, not
@@ -72,13 +89,31 @@ export async function loadAiConfig(
   return {
     provider: row.provider,
     model: row.model,
-    apiKey: decrypt(row.api_key),
+    // '' for claude-agent-sdk (never read — see providers/claude-agent-sdk.ts).
+    apiKey: row.api_key ? decrypt(row.api_key) : '',
     systemPrompt: row.system_prompt,
     isActive: row.is_active,
     autoReplyEnabled: row.auto_reply_enabled,
     autoReplyMaxPerConversation: row.auto_reply_max_per_conversation,
     handoffAgentId: row.handoff_agent_id,
     embeddingsApiKey,
+    commercialModeEnabled: row.commercial_mode_enabled,
+    commercialSystemPrompt: row.commercial_system_prompt,
+    commercialBookingUrl: row.commercial_booking_url,
+    commercialWelcomeMessage: row.commercial_welcome_message,
+    commercialCalendarId: row.commercial_calendar_id,
+    teamPhoneNumbers: row.team_phone_numbers ?? [],
+    handoffMessage: row.handoff_message,
+    // NOT NULL DEFAULT 2 na base de dados (migração 050) — o ?? aqui é
+    // só defesa extra para linhas antigas escritas antes da coluna
+    // existir ou literais de teste que não a definem.
+    maxHandoffBlockedAttempts: row.max_handoff_blocked_attempts ?? 2,
+    notifyPhoneNumbers: row.notify_phone_numbers ?? [],
+    // NOT NULL DEFAULT 10 / 60 na base de dados (migração 054) — o ??
+    // aqui é só defesa extra, mesmo padrão de maxHandoffBlockedAttempts
+    // acima, para linhas antigas ou literais de teste sem estas colunas.
+    rateLimitMessagesPerMinute: row.rate_limit_messages_per_minute ?? 10,
+    rateLimitNewNumbersPerHour: row.rate_limit_new_numbers_per_hour ?? 60,
   }
 }
 

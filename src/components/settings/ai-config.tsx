@@ -41,12 +41,19 @@ const HANDOFF_QUEUE = '__queue__';
 const PROVIDER_LABEL: Record<AiProvider, string> = {
   openai: 'OpenAI',
   anthropic: 'Anthropic (Claude)',
+  'claude-agent-sdk': 'Claude (subscrição Eter)',
 };
 
 const KEY_PLACEHOLDER: Record<AiProvider, string> = {
   openai: 'sk-...',
   anthropic: 'sk-ant-...',
+  'claude-agent-sdk': '',
 };
+
+/** No per-account key for this provider — it authenticates with the
+ *  Eter subscription (CLAUDE_CODE_OAUTH_TOKEN in the service's own
+ *  environment, see src/lib/ai/providers/claude-agent-sdk.ts). */
+const PROVIDER_USES_ETER_SUBSCRIPTION = (p: AiProvider) => p === 'claude-agent-sdk';
 
 export function AiConfig() {
   const { accountId, accountRole, profileLoading } = useAuth();
@@ -76,6 +83,22 @@ export function AiConfig() {
   const [handoffAgentId, setHandoffAgentId] = useState('');
   const [members, setMembers] = useState<AccountMember[]>([]);
 
+  // Bloco 3-A — commercial mode (Meta Click-to-WhatsApp ad leads).
+  const [commercialModeEnabled, setCommercialModeEnabled] = useState(false);
+  const [commercialSystemPrompt, setCommercialSystemPrompt] = useState('');
+  const [commercialBookingUrl, setCommercialBookingUrl] = useState('');
+  const [commercialWelcomeMessage, setCommercialWelcomeMessage] = useState('');
+  // Real scheduling (service-account calendar) — see docs/eter-agent-config.md.
+  const [commercialCalendarId, setCommercialCalendarId] = useState('');
+  const [commercialBusyCalendarIds, setCommercialBusyCalendarIds] = useState('');
+  const [commercialDurationMin, setCommercialDurationMin] = useState(30);
+  const [commercialTimezone, setCommercialTimezone] = useState('Europe/Lisbon');
+  const [commercialHoursStart, setCommercialHoursStart] = useState('09:00');
+  const [commercialHoursEnd, setCommercialHoursEnd] = useState('18:00');
+  const [commercialMinLeadMin, setCommercialMinLeadMin] = useState(120);
+  const [commercialBufferMin, setCommercialBufferMin] = useState(15);
+  const [commercialMaxDaysAhead, setCommercialMaxDaysAhead] = useState(10);
+
   // Guard keyed on the account (not a bare boolean) so an in-place
   // account switch — ownership transfer, multi-account membership —
   // refetches instead of showing the previous account's config. Mirrors
@@ -100,6 +123,28 @@ export function AiConfig() {
         setAutoReplyEnabled(data.auto_reply_enabled);
         setMaxPerConversation(data.auto_reply_max_per_conversation ?? 3);
         setHandoffAgentId(data.handoff_agent_id ?? '');
+        setCommercialModeEnabled(Boolean(data.commercial_mode_enabled));
+        setCommercialSystemPrompt(data.commercial_system_prompt ?? '');
+        setCommercialBookingUrl(data.commercial_booking_url ?? '');
+        setCommercialWelcomeMessage(data.commercial_welcome_message ?? '');
+        setCommercialCalendarId(data.commercial_calendar_id ?? '');
+        setCommercialBusyCalendarIds(
+          Array.isArray(data.commercial_busy_calendar_ids)
+            ? data.commercial_busy_calendar_ids.join(', ')
+            : '',
+        );
+        setCommercialDurationMin(data.commercial_meeting_duration_min ?? 30);
+        setCommercialTimezone(data.commercial_timezone ?? 'Europe/Lisbon');
+        {
+          const monWindow = data.commercial_business_hours?.mon?.[0] as
+            | [string, string]
+            | undefined;
+          setCommercialHoursStart(monWindow?.[0] ?? '09:00');
+          setCommercialHoursEnd(monWindow?.[1] ?? '18:00');
+        }
+        setCommercialMinLeadMin(data.commercial_min_lead_time_min ?? 120);
+        setCommercialBufferMin(data.commercial_buffer_min ?? 15);
+        setCommercialMaxDaysAhead(data.commercial_max_business_days_ahead ?? 10);
         setHasStoredKey(Boolean(data.has_key));
         setApiKey(data.has_key ? MASKED_KEY : '');
         setKeyEdited(false);
@@ -131,11 +176,15 @@ export function AiConfig() {
     const isDefaultModel =
       model === AI_PROVIDER_DEFAULT_MODEL.openai ||
       model === AI_PROVIDER_DEFAULT_MODEL.anthropic ||
+      model === AI_PROVIDER_DEFAULT_MODEL['claude-agent-sdk'] ||
       model.trim() === '';
     if (isDefaultModel) setModel(AI_PROVIDER_DEFAULT_MODEL[next]);
   };
 
-  const keyPayload = () => (keyEdited ? apiKey.trim() : undefined);
+  // No key to send for the Eter-subscription provider — see
+  // PROVIDER_USES_ETER_SUBSCRIPTION.
+  const keyPayload = () =>
+    PROVIDER_USES_ETER_SUBSCRIPTION(provider) ? undefined : keyEdited ? apiKey.trim() : undefined;
 
   // undefined = leave unchanged; '' typed = null (clear); text = set.
   const embeddingsKeyPayload = () =>
@@ -151,6 +200,22 @@ export function AiConfig() {
     auto_reply_enabled: autoReplyEnabled,
     auto_reply_max_per_conversation: maxPerConversation,
     handoff_agent_id: handoffAgentId || null,
+    commercial_mode_enabled: commercialModeEnabled,
+    commercial_system_prompt: commercialSystemPrompt.trim() || null,
+    commercial_booking_url: commercialBookingUrl.trim() || null,
+    commercial_welcome_message: commercialWelcomeMessage.trim() || null,
+    commercial_calendar_id: commercialCalendarId.trim() || null,
+    commercial_busy_calendar_ids: commercialBusyCalendarIds
+      .split(',')
+      .map((v) => v.trim())
+      .filter(Boolean),
+    commercial_meeting_duration_min: commercialDurationMin,
+    commercial_timezone: commercialTimezone.trim() || 'Europe/Lisbon',
+    commercial_business_hours_start: commercialHoursStart,
+    commercial_business_hours_end: commercialHoursEnd,
+    commercial_min_lead_time_min: commercialMinLeadMin,
+    commercial_buffer_min: commercialBufferMin,
+    commercial_max_business_days_ahead: commercialMaxDaysAhead,
   });
 
   const handleTest = async () => {
@@ -180,7 +245,7 @@ export function AiConfig() {
       toast.error(t('missingModel'));
       return;
     }
-    if (!configured && !keyEdited) {
+    if (!PROVIDER_USES_ETER_SUBSCRIPTION(provider) && !configured && !keyEdited) {
       toast.error(t('missingApiKey'));
       return;
     }
@@ -219,6 +284,19 @@ export function AiConfig() {
         setAutoReplyEnabled(false);
         setSystemPrompt('');
         setHandoffAgentId('');
+        setCommercialModeEnabled(false);
+        setCommercialSystemPrompt('');
+        setCommercialBookingUrl('');
+        setCommercialWelcomeMessage('');
+        setCommercialCalendarId('');
+        setCommercialBusyCalendarIds('');
+        setCommercialDurationMin(30);
+        setCommercialTimezone('Europe/Lisbon');
+        setCommercialHoursStart('09:00');
+        setCommercialHoursEnd('18:00');
+        setCommercialMinLeadMin(120);
+        setCommercialBufferMin(15);
+        setCommercialMaxDaysAhead(10);
       } else {
         const data = await res.json();
         toast.error(data.error ?? t('removeFailed'));
@@ -281,6 +359,9 @@ export function AiConfig() {
                     <SelectItem value="anthropic">
                       {PROVIDER_LABEL.anthropic}
                     </SelectItem>
+                    <SelectItem value="claude-agent-sdk">
+                      {PROVIDER_LABEL['claude-agent-sdk']}
+                    </SelectItem>
                   </SelectContent>
                 </Select>
               </div>
@@ -297,43 +378,14 @@ export function AiConfig() {
               </div>
             </div>
 
-            <div className="space-y-2">
-              <Label htmlFor="ai-key">{t('apiKey')}</Label>
-              <div className="flex gap-2">
-                <div className="relative flex-1">
-                  <Input
-                    id="ai-key"
-                    type={showKey ? 'text' : 'password'}
-                    value={apiKey}
-                    onChange={(e) => {
-                      setApiKey(e.target.value);
-                      setKeyEdited(true);
-                    }}
-                    onFocus={() => {
-                      if (!keyEdited && hasStoredKey) {
-                        setApiKey('');
-                        setKeyEdited(true);
-                      }
-                    }}
-                    placeholder={KEY_PLACEHOLDER[provider]}
-                    disabled={disabled}
-                    autoComplete="off"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setShowKey((s) => !s)}
-                    className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
-                    tabIndex={-1}
-                  >
-                    {showKey ? (
-                      <EyeOff className="h-4 w-4" />
-                    ) : (
-                      <Eye className="h-4 w-4" />
-                    )}
-                  </button>
-                </div>
+            {PROVIDER_USES_ETER_SUBSCRIPTION(provider) ? (
+              <div className="space-y-2 rounded-md border border-dashed p-3">
+                <p className="text-sm text-muted-foreground">
+                  {t('eterSubscriptionNotice')}
+                </p>
                 <Button
                   variant="outline"
+                  size="sm"
                   onClick={handleTest}
                   disabled={disabled || testing}
                 >
@@ -345,7 +397,57 @@ export function AiConfig() {
                   {t('testKey')}
                 </Button>
               </div>
-            </div>
+            ) : (
+              <div className="space-y-2">
+                <Label htmlFor="ai-key">{t('apiKey')}</Label>
+                <div className="flex gap-2">
+                  <div className="relative flex-1">
+                    <Input
+                      id="ai-key"
+                      type={showKey ? 'text' : 'password'}
+                      value={apiKey}
+                      onChange={(e) => {
+                        setApiKey(e.target.value);
+                        setKeyEdited(true);
+                      }}
+                      onFocus={() => {
+                        if (!keyEdited && hasStoredKey) {
+                          setApiKey('');
+                          setKeyEdited(true);
+                        }
+                      }}
+                      placeholder={KEY_PLACEHOLDER[provider]}
+                      disabled={disabled}
+                      autoComplete="off"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowKey((s) => !s)}
+                      className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                      tabIndex={-1}
+                    >
+                      {showKey ? (
+                        <EyeOff className="h-4 w-4" />
+                      ) : (
+                        <Eye className="h-4 w-4" />
+                      )}
+                    </button>
+                  </div>
+                  <Button
+                    variant="outline"
+                    onClick={handleTest}
+                    disabled={disabled || testing}
+                  >
+                    {testing ? (
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    ) : (
+                      <CheckCircle2 className="mr-2 h-4 w-4" />
+                    )}
+                    {t('testKey')}
+                  </Button>
+                </div>
+              </div>
+            )}
 
             <div className="space-y-2">
               <Label htmlFor="ai-embeddings-key">
@@ -482,6 +584,213 @@ export function AiConfig() {
                   ))}
                 </SelectContent>
               </Select>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">{t('commercialTitle')}</CardTitle>
+            <CardDescription>{t('commercialDesc')}</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="flex items-center justify-between gap-4 rounded-md border border-border p-3">
+              <div>
+                <p className="text-sm font-medium text-foreground">
+                  {t('commercialEnable')}
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  {t('commercialEnableDesc')}
+                </p>
+              </div>
+              <Switch
+                checked={commercialModeEnabled}
+                onCheckedChange={setCommercialModeEnabled}
+                disabled={disabled || !autoReplyEnabled}
+              />
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="ai-commercial-prompt">{t('commercialPrompt')}</Label>
+              <Textarea
+                id="ai-commercial-prompt"
+                value={commercialSystemPrompt}
+                onChange={(e) => setCommercialSystemPrompt(e.target.value)}
+                placeholder={t('commercialPromptPlaceholder')}
+                rows={4}
+                disabled={disabled}
+              />
+              <p className="text-xs text-muted-foreground">
+                {t('commercialPromptHint')}
+              </p>
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="ai-commercial-booking-url">
+                {t('commercialBookingUrl')}
+              </Label>
+              <Input
+                id="ai-commercial-booking-url"
+                value={commercialBookingUrl}
+                onChange={(e) => setCommercialBookingUrl(e.target.value)}
+                placeholder="https://cal.com/eter-growth/intro"
+                disabled={disabled}
+              />
+              <p className="text-xs text-muted-foreground">
+                {t('commercialBookingUrlHint')}
+              </p>
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="ai-commercial-welcome">
+                {t('commercialWelcome')}
+              </Label>
+              <Textarea
+                id="ai-commercial-welcome"
+                value={commercialWelcomeMessage}
+                onChange={(e) => setCommercialWelcomeMessage(e.target.value)}
+                placeholder={t('commercialWelcomePlaceholder')}
+                rows={3}
+                disabled={disabled}
+              />
+              <p className="text-xs text-muted-foreground">
+                {t('commercialWelcomeHint')}
+              </p>
+            </div>
+
+            <div className="space-y-2 rounded-md border border-border p-3">
+              <p className="text-sm font-medium text-foreground">
+                {t('commercialSchedulingTitle')}
+              </p>
+              <p className="text-xs text-muted-foreground">
+                {t('commercialSchedulingDesc')}
+              </p>
+
+              <div className="grid gap-4 pt-2 sm:grid-cols-2">
+                <div className="space-y-2">
+                  <Label htmlFor="ai-commercial-calendar-id">
+                    {t('commercialCalendarId')}
+                  </Label>
+                  <Input
+                    id="ai-commercial-calendar-id"
+                    value={commercialCalendarId}
+                    onChange={(e) => setCommercialCalendarId(e.target.value)}
+                    placeholder="c_....@group.calendar.google.com"
+                    disabled={disabled}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="ai-commercial-busy-ids">
+                    {t('commercialBusyCalendarIds')}
+                  </Label>
+                  <Input
+                    id="ai-commercial-busy-ids"
+                    value={commercialBusyCalendarIds}
+                    onChange={(e) => setCommercialBusyCalendarIds(e.target.value)}
+                    placeholder="primary, c_....@group.calendar.google.com"
+                    disabled={disabled}
+                  />
+                </div>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                {t('commercialCalendarHint')}
+              </p>
+
+              <div className="grid gap-4 pt-2 sm:grid-cols-3">
+                <div className="space-y-2">
+                  <Label htmlFor="ai-commercial-duration">
+                    {t('commercialDuration')}
+                  </Label>
+                  <Input
+                    id="ai-commercial-duration"
+                    type="number"
+                    min={5}
+                    value={commercialDurationMin}
+                    onChange={(e) => setCommercialDurationMin(Math.max(5, Number(e.target.value) || 30))}
+                    disabled={disabled}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="ai-commercial-buffer">
+                    {t('commercialBuffer')}
+                  </Label>
+                  <Input
+                    id="ai-commercial-buffer"
+                    type="number"
+                    min={0}
+                    value={commercialBufferMin}
+                    onChange={(e) => setCommercialBufferMin(Math.max(0, Number(e.target.value) || 0))}
+                    disabled={disabled}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="ai-commercial-min-lead">
+                    {t('commercialMinLead')}
+                  </Label>
+                  <Input
+                    id="ai-commercial-min-lead"
+                    type="number"
+                    min={0}
+                    value={commercialMinLeadMin}
+                    onChange={(e) => setCommercialMinLeadMin(Math.max(0, Number(e.target.value) || 0))}
+                    disabled={disabled}
+                  />
+                </div>
+              </div>
+
+              <div className="grid gap-4 pt-2 sm:grid-cols-3">
+                <div className="space-y-2">
+                  <Label htmlFor="ai-commercial-hours-start">
+                    {t('commercialHoursStart')}
+                  </Label>
+                  <Input
+                    id="ai-commercial-hours-start"
+                    value={commercialHoursStart}
+                    onChange={(e) => setCommercialHoursStart(e.target.value)}
+                    placeholder="09:00"
+                    disabled={disabled}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="ai-commercial-hours-end">
+                    {t('commercialHoursEnd')}
+                  </Label>
+                  <Input
+                    id="ai-commercial-hours-end"
+                    value={commercialHoursEnd}
+                    onChange={(e) => setCommercialHoursEnd(e.target.value)}
+                    placeholder="18:00"
+                    disabled={disabled}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="ai-commercial-max-days">
+                    {t('commercialMaxDaysAhead')}
+                  </Label>
+                  <Input
+                    id="ai-commercial-max-days"
+                    type="number"
+                    min={1}
+                    value={commercialMaxDaysAhead}
+                    onChange={(e) => setCommercialMaxDaysAhead(Math.max(1, Number(e.target.value) || 10))}
+                    disabled={disabled}
+                  />
+                </div>
+              </div>
+
+              <div className="space-y-2 pt-2">
+                <Label htmlFor="ai-commercial-timezone">
+                  {t('commercialTimezone')}
+                </Label>
+                <Input
+                  id="ai-commercial-timezone"
+                  value={commercialTimezone}
+                  onChange={(e) => setCommercialTimezone(e.target.value)}
+                  placeholder="Europe/Lisbon"
+                  disabled={disabled}
+                  className="max-w-xs"
+                />
+              </div>
             </div>
           </CardContent>
         </Card>

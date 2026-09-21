@@ -9,11 +9,22 @@ import { verifyMetaWebhookSignature } from '@/lib/whatsapp/webhook-signature'
 import { runAutomationsForTrigger } from '@/lib/automations/engine'
 import { dispatchInboundToFlows } from '@/lib/flows/engine'
 import { dispatchInboundToAiReply } from '@/lib/ai/auto-reply'
+import { syncMetaAdLeadToCrm } from '@/lib/crm/sync'
 import { dispatchWebhookEvent } from '@/lib/webhooks/deliver'
 import {
   handleTemplateWebhookChange,
   isTemplateWebhookField,
 } from '@/lib/whatsapp/template-webhook'
+import { handleInboundPendingConfirmation } from '@/lib/eter/pending-confirmation'
+import { cancelFollowUpCadence } from '@/lib/eter/followups'
+import { handleInboundDataDeletionRequest } from '@/lib/eter/data-deletion'
+import {
+  forwardApprovalDecision,
+  isAisdrApprovalForwardEnabled,
+  isAuthorizedApprover,
+  parseApprovalButtonId,
+  verifyApprovalContext,
+} from '@/lib/eter/aisdr-approval-forward'
 
 // The `after()` callback in POST runs within this route's max duration.
 // Inbound processing can fan out to per-media Meta verification calls, so
@@ -60,6 +71,26 @@ interface WhatsAppMessage {
   }
   /** Present when the customer swipe-replies to one of our messages. */
   context?: { id: string }
+  /**
+   * Bloco 3-A — present when this message is the result of the
+   * customer tapping a Meta "Click to WhatsApp" ad or post. Meta's
+   * shape is loosely documented and fields can be missing depending on
+   * the ad/post type, so every field here is optional and every read
+   * of it downstream must be defensive (see persistAdReferral below).
+   */
+  referral?: {
+    source_type?: string
+    source_id?: string
+    source_url?: string
+    headline?: string
+    body?: string
+    /** Click id — needed later for the Conversions API. Personal/
+     *  tracking data: never log this in plaintext. */
+    ctwa_clid?: string
+    media_type?: string
+    image_url?: string
+    video_url?: string
+  }
 }
 
 interface WhatsAppWebhookEntry {
@@ -291,6 +322,80 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
         const message = value.messages[i]
         const contact = value.contacts[i] || value.contacts[0]
 
+        // AI SDR approval buttons ([Enviar]/[Descartar]) — MUST run
+        // before the normal cascade below (contact/conversation
+        // creation, flows, automations, AI auto-reply). These taps are
+        // Ricardo deciding on a LinkedIn/WhatsApp outreach approval,
+        // not a lead messaging in; they are forwarded to the AI SDR
+        // worker and never touch the inbox. See
+        // src/lib/eter/aisdr-approval-forward.ts for the full contract
+        // (button id shape, retry/idempotency/queue behaviour) — this
+        // fixes approvals that fell into the void after the single Meta
+        // webhook moved to this app on 11 Aug (see migration 042).
+        //
+        // Gated behind AISDR_APPROVAL_FORWARD_ENABLED so it can be
+        // disabled without reverting code; when disabled (or the
+        // tapped button doesn't match the aisdr_ pattern) the message
+        // falls through to the normal cascade unchanged.
+        if (isAisdrApprovalForwardEnabled() && message.type === 'interactive') {
+          const buttonId = message.interactive?.button_reply?.id
+          const parsed = buttonId ? parseApprovalButtonId(buttonId) : null
+          if (parsed) {
+            // SECURITY — forgery guard. `approval_id` is a small
+            // sequential integer, trivially guessable, and Meta's
+            // webhook payload carries no cryptographic proof of who
+            // tapped the button beyond `message.from`. This check MUST
+            // run first, before any HTTP call to the AI SDR worker or
+            // any write to `aisdr_approval_forwards` — an unauthorized
+            // sender must not be able to trigger network calls or DB
+            // writes just by sending well-shaped button ids (DoS via
+            // wasted retries/queue rows). See
+            // isAuthorizedApprover/getAuthorizedApproverPhones in
+            // aisdr-approval-forward.ts for the fail-closed allowlist.
+            if (!isAuthorizedApprover(message.from)) {
+              console.error(
+                '[webhook] SEGURANÇA: tentativa de aprovação AI SDR de remetente não autorizado — ' +
+                  `from=${message.from} approval_id=${parsed.approvalId} decisao=${parsed.decision} ` +
+                  `wa_message_id=${message.id} — recusado antes de qualquer chamada de rede ou escrita em BD. ` +
+                  'Ver AISDR_APPROVER_PHONES em docs/eter-agent-config.md.',
+              )
+              continue
+            }
+
+            // Context-id check — see verifyApprovalContext's doc
+            // comment: PREPARED BUT INACTIVE (this repo has no stored
+            // mapping from approval_id to the outbound approval
+            // message's wamid yet). Logged for future audit; never
+            // gates today since it can only ever return 'not_provided'
+            // or 'unverifiable'. If it's ever wired to return
+            // 'mismatch', treat that identically to an unauthorized
+            // sender above.
+            const contextCheck = verifyApprovalContext(message.context?.id, parsed.approvalId)
+            if (contextCheck === 'mismatch') {
+              console.error(
+                '[webhook] SEGURANÇA: aprovação AI SDR com context.id que não corresponde à ' +
+                  `mensagem de aprovação enviada — approval_id=${parsed.approvalId} recusado.`,
+              )
+              continue
+            }
+
+            await forwardApprovalDecision(supabaseAdmin(), {
+              accountId: config.account_id,
+              waMessageId: message.id,
+              approvalId: parsed.approvalId,
+              decision: parsed.decision,
+            }).catch((err) => {
+              // forwardApprovalDecision documents that it never throws
+              // (every failure path ends in a queued row + alert) —
+              // this catch is belt-and-braces only, matching the rest
+              // of this cascade, so an unexpected exception here can
+              // never take down the webhook's other messages.
+              console.error('[webhook] forwardApprovalDecision threw unexpectedly:', err)
+            })
+            continue
+          }
+        }
+
         await processMessage(
           message,
           contact,
@@ -500,6 +605,66 @@ async function lookupInternalIdByMetaId(
 }
 
 /**
+ * Bloco 3-A — persist the Meta ad/post referral (if any) onto the
+ * conversation it opened or continued.
+ *
+ * Only `source_type === 'ad'` is treated as a commercial lead —
+ * `'post'` referrals (organic post taps) don't get the commercial
+ * persona today. Defensive by design: `message.referral` and every
+ * field on it can be absent depending on the ad type Meta sends, so
+ * this never assumes a shape and never throws — a failure here must
+ * not break the rest of the inbound cascade (contact/conversation
+ * already exist by the time this runs).
+ *
+ * - New conversation + fresh ad referral → stamp `source = 'meta_ad'`
+ *   and `first_referral_at = now()`.
+ * - Existing conversation + a NEW ad referral (the lead clicked another
+ *   ad into the same thread) → refresh ad_id/ctwa_clid/text, but never
+ *   overwrite an already-set `first_referral_at` — that column always
+ *   records the FIRST click that opened the relationship, not the most
+ *   recent one.
+ *
+ * PRIVACY: `ctwa_clid` and the referral text are lead-identifying
+ * data — never interpolate them into a log line, only `error.message`
+ * from a failed write.
+ */
+async function persistAdReferral(
+  conversation: { id: string; first_referral_at?: string | null },
+  referral: WhatsAppMessage['referral'],
+  isNewConversation: boolean,
+): Promise<void> {
+  if (!referral || referral.source_type !== 'ad') return
+
+  try {
+    const update: Record<string, unknown> = {
+      source: 'meta_ad',
+      ad_id: referral.source_id ?? null,
+      ctwa_clid: referral.ctwa_clid ?? null,
+      referral_headline: referral.headline ?? null,
+      referral_body: referral.body ?? null,
+      referral_source_url: referral.source_url ?? null,
+    }
+    if (isNewConversation || !conversation.first_referral_at) {
+      update.first_referral_at = new Date().toISOString()
+    }
+
+    const { error } = await supabaseAdmin()
+      .from('conversations')
+      .update(update)
+      .eq('id', conversation.id)
+
+    if (error) {
+      console.error('[webhook] failed to persist ad referral:', error.message)
+    }
+  } catch (err) {
+    console.error(
+      '[webhook] unexpected error persisting ad referral:',
+      err instanceof Error ? err.message : err,
+    )
+  }
+}
+
+/**
  * Persist an inbound reaction. WhatsApp reactions are not new messages —
  * they're per-(target, actor) state. We upsert / delete on
  * `message_reactions`, never write a row into `messages`.
@@ -601,6 +766,31 @@ async function processMessage(
     await dispatchWebhookEvent(supabaseAdmin(), accountId, 'conversation.created', {
       conversation_id: conversation.id,
       contact_id: contactRecord.id,
+    })
+  }
+
+  // Bloco 3-A — persist the Meta ad referral (if any) before anything
+  // else touches this conversation, so `source='meta_ad'` is already in
+  // place by the time the AI auto-reply dispatch (below) decides which
+  // persona to use. Awaited (not fire-and-forget) for the same reason —
+  // that decision reads the row fresh from the DB. Best-effort/never
+  // throws (see persistAdReferral's doc comment).
+  await persistAdReferral(conversation, message.referral, convResult.created)
+
+  // Bloco 3-A — one-way CRM sync (Twenty). Only when this referral is
+  // a genuine ad click (persistAdReferral only stamps source='meta_ad'
+  // for `source_type === 'ad'` — see its doc comment). Fire-and-forget:
+  // syncMetaAdLeadToCrm never throws and is intentionally NOT awaited,
+  // so a slow/down Twenty can never delay or break this webhook (see
+  // that function's header for the full fail-safe contract). It does
+  // its own account-level `crm_sync_enabled` check internally, so this
+  // call site doesn't need to know whether the feature is even on.
+  if (message.referral?.source_type === 'ad') {
+    void syncMetaAdLeadToCrm({
+      db: supabaseAdmin(),
+      accountId,
+      conversationId: conversation.id,
+      contactId: contactRecord.id,
     })
   }
 
@@ -714,6 +904,52 @@ async function processMessage(
   // trigger installed in migration 003).
   await flagBroadcastReplyIfAny(accountId, contactRecord.id)
 
+  // Eter agent — quiet-lead follow-up cadence (agent_scheduled_messages,
+  // migration 039). ANY inbound message from the lead cancels the
+  // pending T+1/T+3/T+7 cadence, not just a reply to a follow-up
+  // itself — the lead engaging at all means the quiet period is over.
+  // Never allowed to affect the rest of the cascade below: best-effort,
+  // never throws.
+  await cancelFollowUpCadence(supabaseAdmin(), accountId, conversation.id).catch((err) =>
+    console.error('[webhook] failed to cancel follow-up cadence:', err)
+  )
+
+  // RGPD data-deletion trigger (data_deletion_requests, migration 041).
+  // Checked BEFORE flow/automation/AI dispatch, and only for plain text
+  // messages, so an "APAGAR"/"CANCELAR" reply is honoured deterministically
+  // regardless of what flow or automation state the conversation is in.
+  // A match short-circuits the rest of the cascade below (flows,
+  // automations, pending-confirmation, AI auto-reply) the same way the
+  // reaction short-circuit does earlier in this function, so a lead who
+  // is mid-flow and asks to be forgotten does not also get an unrelated
+  // flow/automation reply on top of the deletion confirmation.
+  if (message.type === 'text' && message.text?.body) {
+    const dataDeletionOutcome = await handleInboundDataDeletionRequest({
+      db: supabaseAdmin(),
+      accountId,
+      conversationId: conversation.id,
+      contactId: contactRecord.id,
+      userId: configOwnerUserId,
+      phone: senderPhone,
+      profileName: contactName || null,
+      rawText: message.text.body,
+    }).catch((err) => {
+      console.error('[webhook] data-deletion handling failed:', err)
+      return 'none' as const
+    })
+
+    if (dataDeletionOutcome !== 'none') {
+      await dispatchWebhookEvent(supabaseAdmin(), accountId, 'message.received', {
+        conversation_id: conversation.id,
+        contact_id: contactRecord.id,
+        whatsapp_message_id: message.id,
+        content_type: contentType,
+        text: contentText,
+      })
+      return
+    }
+  }
+
   // ============================================================
   // Flow runner dispatch.
   //
@@ -811,17 +1047,56 @@ async function processMessage(
     }).catch((err) => console.error('[automations] dispatch failed:', err))
   }
 
-  // AI auto-reply. Runs only for plain-text inbound the deterministic
-  // flow runner did NOT consume (flows win over the LLM), and only when
-  // the account has enabled it. Awaited inside `after()` (same reason as
-  // the webhook dispatch below); `dispatchInboundToAiReply` owns its
-  // eligibility gates + try/catch and never throws.
+  // Eter agent — write-gate confirmation detection (write-gate.ts /
+  // pending-confirmation.ts). Runs under the SAME eligibility gate as
+  // AI auto-reply below (plain text, not consumed by a flow) and
+  // BEFORE it, so an explicit "sim"/"não" reply to a pending calendar
+  // proposal is resolved deterministically instead of being sent to
+  // the LLM as a fresh message. Returns 'none' immediately (a no-op)
+  // for the overwhelming majority of conversations, which have no
+  // pending action — this does not otherwise touch the cascade.
+  // Never throws: any failure here still lets AI auto-reply run below.
+  let pendingConfirmationOutcome: 'none' | 'confirmed' | 'rejected' | 'other' = 'none'
   if (!flowConsumed && !interactiveReplyId && inboundText.trim()) {
+    pendingConfirmationOutcome = await handleInboundPendingConfirmation({
+      db: supabaseAdmin(),
+      accountId,
+      conversationId: conversation.id,
+      contactId: contactRecord.id,
+      userId: configOwnerUserId,
+      inboundText,
+    }).catch((err) => {
+      console.error('[webhook] pending-action confirmation detection failed:', err)
+      return 'none' as const
+    })
+  }
+
+  // AI auto-reply. Runs only for plain-text inbound the deterministic
+  // flow runner did NOT consume (flows win over the LLM), only when the
+  // account has enabled it, and only when the message above wasn't
+  // already resolved as an explicit confirm/reject of a pending
+  // proposal (that reply has already been sent by
+  // handleInboundPendingConfirmation — sending a second, LLM-generated
+  // reply to the same inbound message would double-text the lead).
+  // Awaited inside `after()` (same reason as the webhook dispatch
+  // below); `dispatchInboundToAiReply` owns its eligibility gates +
+  // try/catch and never throws.
+  if (
+    !flowConsumed &&
+    !interactiveReplyId &&
+    inboundText.trim() &&
+    pendingConfirmationOutcome !== 'confirmed' &&
+    pendingConfirmationOutcome !== 'rejected'
+  ) {
     await dispatchInboundToAiReply({
       accountId,
       conversationId: conversation.id,
       contactId: contactRecord.id,
       configOwnerUserId,
+      // Bloco 3-A (migração 054) — drives the new-numbers-per-hour rate
+      // limit: only a message from a phone number the webhook just
+      // created a contact for counts as "a new number".
+      isNewContact: contactOutcome.wasCreated,
     })
   }
 

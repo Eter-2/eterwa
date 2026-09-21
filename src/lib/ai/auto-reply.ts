@@ -2,13 +2,41 @@ import { supabaseAdmin } from './admin-client'
 import { loadAiConfig } from './config'
 import { buildConversationContext } from './context'
 import { retrieveKnowledge } from './knowledge'
-import { generateReply } from './generate'
+import { generateReply, generateReplyWithTools } from './generate'
 import { buildSystemPrompt } from './defaults'
-import { buildHandoffSummary } from './handoff'
+import { buildHandoffSummary, sendHandoffNotice } from './handoff'
+import { notifyHandoff } from '@/lib/notifications/notify-team'
+import {
+  checkHandoffReadiness,
+  buildMissingInfoNudge,
+  shouldForceHandoffThrough,
+  DEFAULT_MAX_HANDOFF_BLOCKED_ATTEMPTS,
+} from './commercial-handoff'
 import { logAiUsage } from './usage'
 import { latestUserMessage } from './query'
 import { engineSendText } from '@/lib/flows/meta-send'
 import { checkRateLimit, RATE_LIMITS } from '@/lib/rate-limit'
+import {
+  checkPerNumberRateLimit,
+  checkNewNumberRateLimit,
+  isExemptFromRateLimit,
+  DEFAULT_RATE_LIMIT_MESSAGES_PER_MINUTE,
+  DEFAULT_RATE_LIMIT_NEW_NUMBERS_PER_HOUR,
+} from './inbound-rate-limit'
+import {
+  isCommercialConversation,
+  sendCommercialFallback,
+  sendCommercialWelcomeIfNeeded,
+} from './commercial'
+import { COMMERCIAL_TOOLS } from './tools/commercial-schema'
+import { createCommercialToolExecutor } from './tools/handlers/commercial'
+import type { GenerateResult } from './types'
+
+/** Base do link da conversa no EterWA, usado no aviso de handoff
+ *  (notify-team.ts). O inbox é uma página única que lê a conversa a
+ *  abrir por query string (`?c=<conversationId>`), não por rota
+ *  `/inbox/<id>` — ver src/app/(dashboard)/inbox/page.tsx. */
+const ETERWA_INBOX_URL = process.env.ETERWA_INBOX_URL ?? 'https://eterwa.etergrowth.com/inbox'
 
 interface DispatchArgs {
   /** Tenancy key — drives config, contact, and whatsapp_config lookups. */
@@ -18,6 +46,13 @@ interface DispatchArgs {
   /** The account's WhatsApp config owner, used for the outbound send's
    *  audit columns (mirrors how the flow runner passes it through). */
   configOwnerUserId: string
+  /**
+   * True when the webhook just created this contact row for this
+   * inbound message — i.e. a genuinely new phone number, not a
+   * returning contact writing again. Drives the new-numbers-per-hour
+   * rate limit (checkNewNumberRateLimit) — see inbound-rate-limit.ts.
+   */
+  isNewContact: boolean
 }
 
 /**
@@ -42,7 +77,7 @@ interface DispatchArgs {
 export async function dispatchInboundToAiReply(
   args: DispatchArgs,
 ): Promise<void> {
-  const { accountId, conversationId, contactId, configOwnerUserId } = args
+  const { accountId, conversationId, contactId, configOwnerUserId, isNewContact } = args
 
   try {
     const db = supabaseAdmin()
@@ -69,7 +104,9 @@ export async function dispatchInboundToAiReply(
 
     const { data: conv, error: convErr } = await db
       .from('conversations')
-      .select('assigned_agent_id, ai_autoreply_disabled, ai_reply_count')
+      .select(
+        'assigned_agent_id, ai_autoreply_disabled, ai_reply_count, source, commercial_welcome_sent_at, escalation_reason, handoff_blocked_attempts, team_requested_at',
+      )
       .eq('id', conversationId)
       .maybeSingle()
     if (convErr || !conv) return
@@ -78,6 +115,65 @@ export async function dispatchInboundToAiReply(
     // Cheap early-out; the authoritative cap check is the atomic claim
     // below (this read can race a concurrent inbound).
     if (conv.ai_reply_count >= config.autoReplyMaxPerConversation) return
+
+    // Bloco 3-A — commercial mode is now the DEFAULT persona for anyone
+    // who writes, from an ad referral or directly, once the account
+    // turned it on and configured a commercial prompt. The only
+    // exception is a phone number on the team list
+    // (`config.teamPhoneNumbers`), which always gets the internal
+    // persona instead — see isCommercialConversation.
+    const { data: contactRow } = await db
+      .from('contacts')
+      .select('phone, name, email, company')
+      .eq('id', contactId)
+      .maybeSingle()
+    const isCommercial = isCommercialConversation(config, contactRow?.phone ?? null)
+
+    // Bloco 3-A — limite de mensagens antes de a IA responder (migração
+    // 054). Corre DEPOIS de a mensagem já estar guardada em `messages`
+    // pelo webhook (esse INSERT acontece antes de dispatchInboundToAiReply
+    // ser chamado — ver route.ts) e ANTES de qualquer coisa que custe
+    // dinheiro: a mensagem de boas-vindas comercial (WhatsApp) e a
+    // chamada à IA (tokens). Números da equipa e de notificação estão
+    // isentos do limite por número. Ver inbound-rate-limit.ts para o
+    // desenho completo (contadores em BD, atómico, à prova de falha
+    // deixando passar).
+    const exempt = isExemptFromRateLimit(config, contactRow?.phone ?? null)
+    const perNumberDecision = await checkPerNumberRateLimit({
+      db,
+      accountId,
+      phone: contactRow?.phone ?? '',
+      isExempt: exempt,
+      limitPerMinute:
+        config.rateLimitMessagesPerMinute ?? DEFAULT_RATE_LIMIT_MESSAGES_PER_MINUTE,
+    })
+    if (!perNumberDecision.allowed) return
+
+    const newNumberDecision = await checkNewNumberRateLimit({
+      db,
+      accountId,
+      isNewContact,
+      limitPerHour:
+        config.rateLimitNewNumbersPerHour ?? DEFAULT_RATE_LIMIT_NEW_NUMBERS_PER_HOUR,
+    })
+    if (!newNumberDecision.allowed) return
+
+    if (isCommercial) {
+      // Sent FIRST, unconditionally, before any AI call — guarantees a
+      // reply lands inside WhatsApp's 24h session window even if the AI
+      // generation below is slow, times out, or fails outright. See
+      // sendCommercialWelcomeIfNeeded's doc comment for why. Never
+      // throws, so a send failure here still lets the AI reply below
+      // attempt to run.
+      await sendCommercialWelcomeIfNeeded({
+        db,
+        accountId,
+        conversationId,
+        contactId,
+        configOwnerUserId,
+        welcomeMessage: config.commercialWelcomeMessage,
+      })
+    }
 
     const messages = await buildConversationContext(db, conversationId)
     if (messages.length === 0) return
@@ -107,22 +203,72 @@ export async function dispatchInboundToAiReply(
     )
 
     const systemPrompt = buildSystemPrompt({
-      userPrompt: config.systemPrompt,
-      mode: 'auto_reply',
+      userPrompt: isCommercial ? config.commercialSystemPrompt ?? null : config.systemPrompt,
+      mode: isCommercial ? 'commercial_reply' : 'auto_reply',
       knowledge,
+      commercialBookingUrl: isCommercial ? config.commercialBookingUrl : undefined,
+      commercialCalendarConfigured: isCommercial ? !!config.commercialCalendarId : undefined,
+      teamAlreadyRequested: isCommercial ? !!conv.team_requested_at : undefined,
     })
 
-    const { text, handoff, usage } = await generateReply({
-      config,
-      systemPrompt,
-      messages,
-    })
+    // The 24h-window guarantee (see sendCommercialWelcomeIfNeeded above)
+    // extends to the substantive reply too: if the provider call throws
+    // (network error, invalid key, or the AiError timeout wrapper in
+    // aiRequestTimeoutMs) we must not leave the lead in silence — send a
+    // short fixed fallback instead of letting the exception bubble to
+    // this function's outer catch (which would just log and return).
+    // Non-commercial conversations keep today's behaviour exactly:
+    // rethrow so the outer catch handles it the way it always has.
+    let generation: GenerateResult
+    try {
+      if (isCommercial) {
+        // Bloco 3-A — real scheduling. The commercial persona gets its
+        // own small tool set (check_commercial_availability /
+        // book_commercial_meeting, against the dedicated leads
+        // calendar) via the agentic tool-calling loop. Non-commercial
+        // conversations never take this branch — they keep calling
+        // plain `generateReply` exactly as before, no tools at all.
+        generation = await generateReplyWithTools({
+          config,
+          systemPrompt,
+          messages,
+          tools: COMMERCIAL_TOOLS,
+          executor: createCommercialToolExecutor({
+            db,
+            accountId,
+            conversationId,
+            contactId,
+            defaultNotifyUserId: config.handoffAgentId ?? null,
+          }),
+        })
+      } else {
+        generation = await generateReply({ config, systemPrompt, messages })
+      }
+    } catch (err) {
+      if (isCommercial) {
+        console.error(
+          '[ai auto-reply] commercial mode: geração falhou ou expirou — a enviar fallback:',
+          err instanceof Error ? err.message : err,
+        )
+        await sendCommercialFallback({
+          accountId,
+          conversationId,
+          contactId,
+          configOwnerUserId,
+        })
+        return
+      }
+      throw err
+    }
+    const { text, handoff, usage } = generation
 
     // Record token spend on the account's BYO key. Fire-and-forget so it
     // never adds latency to the customer-facing send: `logAiUsage`
     // swallows its own errors, so the floating promise can't reject.
     // Logged regardless of handoff — the provider call happened either
-    // way.
+    // way. Always logged as 'auto_reply' — the DB CHECK constraint
+    // (migration 033) doesn't know about the commercial persona, which
+    // is a prompt/behaviour variant, not a different billing bucket.
     void logAiUsage(db, {
       accountId,
       conversationId,
@@ -132,14 +278,153 @@ export async function dispatchInboundToAiReply(
       usage,
     })
 
+    // Commercial mode additionally guarantees a reply when the model
+    // came back with nothing usable (empty text, no handoff signal) —
+    // the same 24h-window reasoning as the try/catch above, just for the
+    // "succeeded but said nothing" failure mode instead of a thrown
+    // error. A genuine handoff (explicit sentinel) is NOT covered here:
+    // that's a deliberate "a human should take this" decision, not a
+    // failure, and the welcome message already opened the window.
+    if (isCommercial && !handoff && !text) {
+      console.warn(
+        '[ai auto-reply] commercial mode: o modelo não devolveu texto — a enviar fallback.',
+      )
+      await sendCommercialFallback({
+        accountId,
+        conversationId,
+        contactId,
+        configOwnerUserId,
+      })
+      return
+    }
+
     if (handoff || !text) {
+      // Regra do Ricardo (migração 050) — modo comercial APENAS: nunca
+      // passar a conversa para a equipa sem nome, email e motivo
+      // registados (save_lead_details). Esta trava vive em código, não
+      // só no prompt, porque um prompt cede a quem insista. O modo
+      // interno (números da equipa) nunca passa por aqui — mantém-se
+      // exactamente como antes desta migração.
+      let handoffIncomplete = false
+      if (isCommercial) {
+        const readiness = checkHandoffReadiness({
+          contactName: contactRow?.name,
+          contactEmail: contactRow?.email,
+          escalationReason: conv.escalation_reason as string | null | undefined,
+          contactCompany: contactRow?.company,
+        })
+        if (!readiness.ready) {
+          const attemptsSoFar = (conv.handoff_blocked_attempts as number | null) ?? 0
+          const maxAttempts =
+            config.maxHandoffBlockedAttempts ?? DEFAULT_MAX_HANDOFF_BLOCKED_ATTEMPTS
+          if (!shouldForceHandoffThrough(attemptsSoFar, maxAttempts)) {
+            // Bloqueado: NÃO desliga o auto-reply, NÃO marca a conversa
+            // como passada. Regista a tentativa (sem dados pessoais —
+            // só os nomes dos campos em falta) e pede o que falta.
+            console.warn(
+              `[ai auto-reply] commercial mode: handoff bloqueado (tentativa ${
+                attemptsSoFar + 1
+              }/${maxAttempts}) — em falta: ${readiness.missing.join(', ')}.`,
+            )
+            await db
+              .from('conversations')
+              .update({ handoff_blocked_attempts: attemptsSoFar + 1 })
+              .eq('id', conversationId)
+            await engineSendText({
+              accountId,
+              userId: configOwnerUserId,
+              conversationId,
+              contactId,
+              text: buildMissingInfoNudge(readiness.missing),
+              aiGenerated: false,
+            })
+            return
+          }
+          // Válvula de escape: já bloqueámos vezes suficientes seguidas
+          // — deixa passar mesmo incompleto, para não prender alguém
+          // irritado num ciclo a pedir dados que não quer dar.
+          console.warn(
+            '[ai auto-reply] commercial mode: handoff a passar INCOMPLETO após tentativas bloqueadas repetidas — em falta:',
+            readiness.missing.join(', '),
+          )
+          handoffIncomplete = true
+        }
+      }
+
+      // Regra do Ricardo (21/09/2026, correcção 3) — modo comercial
+      // APENAS: chamar a equipa já não desliga o auto-reply. O agente
+      // continua a responder normalmente (o prompt sabe-o via
+      // `teamAlreadyRequested`) e só se cala quando um humano da
+      // equipa escrever nesta conversa (ver send-message.ts, que
+      // desliga `ai_autoreply_disabled` num envio `sender_type =
+      // 'agent'`). O modo interno (números da equipa) mantém-se
+      // exactamente como antes: desliga logo o auto-reply.
+      if (isCommercial) {
+        if (conv.team_requested_at) {
+          // Já chamámos a equipa nesta conversa — não repetir o aviso
+          // nem o registo. Não há texto substantivo para enviar este
+          // turno (o modelo voltou a sinalizar handoff em vez de
+          // responder); nada mais a fazer.
+          return
+        }
+        await sendHandoffNotice({
+          accountId,
+          conversationId,
+          contactId,
+          configOwnerUserId,
+          handoffMessage: config.handoffMessage,
+        })
+        const summary = buildHandoffSummary({
+          messages,
+          replyCount: conv.ai_reply_count ?? 0,
+          company: contactRow?.company,
+        })
+        const update: Record<string, unknown> = {
+          team_requested_at: new Date().toISOString(),
+          ai_handoff_summary: summary,
+        }
+        if (handoffIncomplete) {
+          update.handoff_incomplete = true
+        }
+        await db.from('conversations').update(update).eq('id', conversationId)
+
+        // Aviso à equipa (Mattermost + WhatsApp) — best-effort, nunca
+        // bloqueia nem desfaz o handoff já persistido acima. Ver
+        // notify-team.ts.
+        void notifyHandoff({
+          accountId,
+          conversationId,
+          contactName: contactRow?.name ?? null,
+          company: contactRow?.company ?? null,
+          phone: contactRow?.phone ?? null,
+          email: contactRow?.email ?? null,
+          reason: (conv.escalation_reason as string | null) ?? null,
+          lastMessages: messages.slice(-3),
+          conversationUrl: `${ETERWA_INBOX_URL}?c=${encodeURIComponent(conversationId)}`,
+        }).catch((err) => {
+          console.error('[ai auto-reply] notifyHandoff falhou:', err)
+        })
+
+        return
+      }
+
       // The model can't (or shouldn't) answer — stop auto-replying on
-      // this thread and hand it to a human. We (a) pause the bot here
+      // this thread and hand it to a human. A handoff must never be
+      // silent: the customer gets a short heads-up FIRST before the bot
+      // goes quiet (see sendHandoffNotice's doc comment — this used to
+      // leave people talking to no one). Then we (a) pause the bot here
       // (sticky until re-enabled), (b) route the conversation to the
       // configured handoff agent — null leaves it in the shared queue —
       // and (c) leave a short internal note so whoever picks it up has
-      // context. Assigning fires the `on_conversation_assigned` trigger,
-      // which notifies the agent.
+      // context. Assigning fires the `on_conversation_assigned`
+      // trigger, which notifies the agent.
+      await sendHandoffNotice({
+        accountId,
+        conversationId,
+        contactId,
+        configOwnerUserId,
+        handoffMessage: config.handoffMessage,
+      })
       const summary = buildHandoffSummary({
         messages,
         replyCount: conv.ai_reply_count ?? 0,

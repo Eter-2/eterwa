@@ -1,0 +1,388 @@
+import type { SupabaseClient } from '@supabase/supabase-js'
+import { decrypt } from '@/lib/whatsapp/encryption'
+import { isUniqueViolation } from '@/lib/contacts/dedupe'
+import { META_API_BASE } from '@/lib/whatsapp/meta-api'
+
+// ============================================================
+// conversions-api.ts — Bloco 4: reporta à Meta, via Conversions API,
+// os eventos de negócio de uma conversa vinda de um anúncio Click to
+// WhatsApp (CTWA), ligados ao clique original pelo `ctwa_clid`
+// guardado na conversa (Bloco 3-A, migração 045).
+//
+// Dois eventos, cada um disparado uma vez por conversa a partir do seu
+// ponto de origem:
+//   - 'LeadSubmitted' — quando checkHandoffReadiness (commercial-handoff.ts)
+//                       passa a `ready: true` dentro de saveLeadDetailsHandler.
+//   - 'QualifiedLead' — quando bookCommercialMeetingHandler confirma uma
+//                       reunião (outcome.status === 'booked') — marcar
+//                       reunião é o sinal mais forte de qualificação que
+//                       temos, por isso reutiliza este nome padrão da
+//                       Meta em vez de um "Schedule" que ela rejeita.
+//
+// Nomes: a Meta só aceita uma lista fixa de valores para `event_name`
+// quando `action_source = 'business_messaging'` — nem 'Lead' nem
+// 'Schedule' (os nomes do brief original) estão nela; um teste em
+// produção (21/09/2026) confirmou a rejeição (error_subcode 2804066).
+// Ver migração 056 e a lista completa de nomes aceites no comentário
+// mais abaixo, junto ao corpo do pedido.
+//
+// Contrato desta função (a mesma disciplina de notify-team.ts e
+// crm/sync.ts): NUNCA lança. Chamar sempre fire-and-forget
+// (`void sendCapiEvent(...).catch(...)`) — uma falha aqui não pode
+// atrasar nem quebrar a resposta ao lead. Toda a falha fica registada
+// em log (sem dados pessoais) e na tabela `meta_capi_events`
+// (migração 055), nunca engolida em silêncio.
+//
+// Dedup: `event_id` é determinístico (`${conversationId}:${eventName}`)
+// e a tabela tem uma UNIQUE nessa coluna — o INSERT inicial (reserva
+// atómica, status='pending') funciona como uma trava contra duas
+// chamadas concorrentes para o mesmo evento (mesmo padrão do
+// claim_ai_reply_slot/commercial_welcome_sent_at do Bloco 3-A, mas via
+// unique constraint em vez de UPDATE...IS NULL). Uma segunda chamada
+// perde a reserva (unique violation) e desiste sem reenviar.
+//
+// Formato do pedido (Conversions API for Business Messaging — ver
+// developers.facebook.com/documentation/ads-commerce/conversions-api/
+// business-messaging): `user_data` leva `ctwa_clid` E
+// `whatsapp_business_account_id` (sem este último a Meta não valida o
+// evento, mesmo com dataset e clique correctos). O access_token
+// reutilizado de `whatsapp_config` precisa das permissões
+// `whatsapp_business_management` + `whatsapp_business_manage_events`
+// (não basta `whatsapp_business_messaging`, que é o que a app já usa
+// para enviar mensagens) — e a app Meta precisa do nível "Marketing
+// API Access Tier" activo. Sem isso, a Meta responde 401/403 e
+// sendCapiEvent regista o erro sem nunca lançar (ver testes).
+//
+// `event_name`, para `action_source = 'business_messaging'`, só pode
+// ser um destes valores fixos (confirmado na documentação oficial —
+// não há eventos custom aqui): Purchase, LeadSubmitted,
+// InitiateCheckout, AddToCart, ViewContent, OrderCreated,
+// OrderShipped, OrderDelivered, OrderCanceled, OrderReturned,
+// CartAbandoned, QualifiedLead, RatingProvided, ReviewProvided.
+// ============================================================
+
+/** Timeout curto — este envio nunca pode atrasar a resposta ao lead. */
+const CAPI_REQUEST_TIMEOUT_MS = 5_000
+const RESPONSE_SUMMARY_MAX = 500
+
+export type CapiEventName = 'LeadSubmitted' | 'QualifiedLead' | 'Purchase'
+
+export interface SendCapiEventArgs {
+  db: SupabaseClient
+  accountId: string
+  conversationId: string
+  eventName: CapiEventName
+}
+
+function truncate(text: string, max: number): string {
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text
+}
+
+/** Grava o resultado (sucesso ou falha) na linha já reservada pelo
+ *  INSERT inicial. Nunca lança — uma falha a escrever a auditoria não
+ *  pode propagar-se para cima de uma chamada que já terminou. */
+async function recordOutcome(
+  db: SupabaseClient,
+  eventId: string,
+  status: 'sent' | 'error',
+  httpStatus: number | null,
+  responseSummary: string | null,
+): Promise<void> {
+  try {
+    const { error } = await db
+      .from('meta_capi_events')
+      .update({ status, http_status: httpStatus, response_summary: responseSummary })
+      .eq('event_id', eventId)
+    if (error) {
+      console.error(`[meta capi] falha a registar o resultado do evento (event_id=${eventId}):`, error.message)
+    }
+  } catch (err) {
+    console.error(
+      `[meta capi] erro inesperado a registar o resultado do evento (event_id=${eventId}):`,
+      err instanceof Error ? err.message : err,
+    )
+  }
+}
+
+/**
+ * Envia um evento de conversão (`Lead` ou `Schedule`) à Meta Conversions
+ * API para uma conversa CTWA, ligado pelo `ctwa_clid` guardado na
+ * conversa. Sem `ctwa_clid` (conversa não veio de um anúncio) ou sem
+ * `meta_capi_dataset_id` configurado na conta, não tenta a chamada —
+ * regista o motivo e sai. Nunca lança.
+ */
+export async function sendCapiEvent(args: SendCapiEventArgs): Promise<void> {
+  const { db, accountId, conversationId, eventName } = args
+  const eventId = `${conversationId}:${eventName}`
+
+  try {
+    // Reserva atómica: perde a corrida (unique violation) → já foi
+    // enviado, ou está a ser enviado agora por outra chamada
+    // concorrente. Qualquer dos casos, não repetir.
+    const { error: claimError } = await db
+      .from('meta_capi_events')
+      .insert({ conversation_id: conversationId, event_name: eventName, event_id: eventId, status: 'pending' })
+    if (claimError) {
+      if (isUniqueViolation(claimError)) return
+      console.error(
+        `[meta capi] falha a reservar o evento ${eventName} (conversation=${conversationId}):`,
+        claimError.message,
+      )
+      return
+    }
+
+    const { data: conv, error: convError } = await db
+      .from('conversations')
+      .select('ctwa_clid')
+      .eq('id', conversationId)
+      .maybeSingle()
+    const ctwaClid = (conv as { ctwa_clid?: string | null } | null)?.ctwa_clid
+    if (convError || !ctwaClid) {
+      await recordOutcome(db, eventId, 'error', null, 'no_ctwa_clid')
+      return
+    }
+
+    const { data: aiConfig } = await db
+      .from('ai_configs')
+      .select('meta_capi_dataset_id, meta_capi_test_event_code')
+      .eq('account_id', accountId)
+      .maybeSingle()
+    const datasetId = (aiConfig as { meta_capi_dataset_id?: string | null } | null)?.meta_capi_dataset_id
+    if (!datasetId) {
+      console.error(
+        `[meta capi] sem meta_capi_dataset_id configurado (account=${accountId}) — evento ${eventName} não enviado.`,
+      )
+      await recordOutcome(db, eventId, 'error', null, 'dataset_not_configured')
+      return
+    }
+    const testEventCode = (aiConfig as { meta_capi_test_event_code?: string | null } | null)
+      ?.meta_capi_test_event_code
+
+    const { data: waConfig, error: waError } = await db
+      .from('whatsapp_config')
+      .select('access_token, waba_id')
+      .eq('account_id', accountId)
+      .maybeSingle()
+    const encryptedToken = (waConfig as { access_token?: string | null } | null)?.access_token
+    if (waError || !encryptedToken) {
+      console.error(`[meta capi] whatsapp_config não encontrado (account=${accountId}) — evento ${eventName} não enviado.`)
+      await recordOutcome(db, eventId, 'error', null, 'whatsapp_config_not_found')
+      return
+    }
+    // A Meta exige `whatsapp_business_account_id` dentro de `user_data`
+    // (ver documentação da Conversions API for Business Messaging) —
+    // sem ele o evento não valida do lado da Meta, mesmo com dataset e
+    // ctwa_clid correctos.
+    const wabaId = (waConfig as { waba_id?: string | null } | null)?.waba_id
+    if (!wabaId) {
+      console.error(`[meta capi] whatsapp_config sem waba_id (account=${accountId}) — evento ${eventName} não enviado.`)
+      await recordOutcome(db, eventId, 'error', null, 'waba_id_not_found')
+      return
+    }
+
+    let accessToken: string
+    try {
+      accessToken = decrypt(encryptedToken)
+    } catch (err) {
+      console.error('[meta capi] falha a decifrar o access_token do WhatsApp:', err)
+      await recordOutcome(db, eventId, 'error', null, 'access_token_decrypt_failed')
+      return
+    }
+
+    const body: Record<string, unknown> = {
+      data: [
+        {
+          event_name: eventName,
+          event_time: Math.floor(Date.now() / 1000),
+          action_source: 'business_messaging',
+          messaging_channel: 'whatsapp',
+          user_data: { ctwa_clid: ctwaClid, whatsapp_business_account_id: wabaId },
+          event_id: eventId,
+        },
+      ],
+    }
+    if (testEventCode) body.test_event_code = testEventCode
+
+    let response: Response
+    try {
+      response = await fetch(`${META_API_BASE}/${datasetId}/events`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(CAPI_REQUEST_TIMEOUT_MS),
+      })
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      console.error(`[meta capi] falha a contactar a Conversions API (evento ${eventName}, conversation=${conversationId}):`, message)
+      await recordOutcome(db, eventId, 'error', null, truncate(`request_failed: ${message}`, RESPONSE_SUMMARY_MAX))
+      return
+    }
+
+    const responseText = await response.text().catch(() => '')
+    if (!response.ok) {
+      console.error(
+        `[meta capi] a Meta respondeu ${response.status} ao evento ${eventName} (conversation=${conversationId}).`,
+      )
+      await recordOutcome(db, eventId, 'error', response.status, truncate(responseText, RESPONSE_SUMMARY_MAX))
+      return
+    }
+
+    await recordOutcome(db, eventId, 'sent', response.status, truncate(responseText, RESPONSE_SUMMARY_MAX))
+  } catch (err) {
+    console.error(
+      `[meta capi] erro inesperado a enviar o evento ${eventName} (conversation=${conversationId}):`,
+      err instanceof Error ? err.message : err,
+    )
+    await recordOutcome(db, eventId, 'error', null, 'unexpected_error')
+  }
+}
+
+// ============================================================
+// Bloco 5: Purchase — negócio ganho no Twenty CRM → Conversions API.
+//
+// Diferente de sendCapiEvent (Bloco 4), este evento não nasce de um
+// passo da conversa em si, nasce do CRM (webhook de opportunity
+// actualizada, ou o cron de reconciliação em
+// src/app/api/crm/twenty/purchases-cron/route.ts). Por isso o dedup é
+// por `opportunityId`, não por `conversationId` — o mesmo negócio
+// nunca deve gerar duas Purchase, mesmo que o webhook do Twenty
+// reenvie o evento (retry) ou o cron o reencontre na janela seguinte.
+//
+// Dois caminhos de `user_data`, escolhidos pelo chamador
+// (src/lib/crm/twenty-purchase.ts) consoante a conversa tem ou não
+// `ctwa_clid`:
+//   - CTWA (`action_source: 'business_messaging'`): ctwa_clid +
+//     whatsapp_business_account_id — mesmo padrão do Bloco 4.
+//   - sem CTWA (`action_source: 'system_generated'`): email/telefone
+//     da pessoa no Twenty, hasheados em SHA-256 (nunca em claro).
+// ============================================================
+
+export type PurchaseUserData =
+  | { kind: 'ctwa'; ctwaClid: string; wabaId: string }
+  | { kind: 'system_generated'; emailHash: string | null; phoneHash: string | null }
+
+export interface SendPurchaseCapiEventArgs {
+  db: SupabaseClient
+  accountId: string
+  conversationId: string
+  opportunityId: string
+  amountEur: number
+  currencyCode: string
+  userData: PurchaseUserData
+}
+
+/**
+ * Envia o evento `Purchase` à Meta Conversions API quando um negócio
+ * é marcado como ganho no Twenty. `event_id` é
+ * `${opportunityId}:Purchase` — determinístico e independente de
+ * quantas vezes o webhook/cron reencontrar o mesmo negócio. Nunca
+ * lança (mesmo contrato de sendCapiEvent).
+ */
+export async function sendPurchaseCapiEvent(args: SendPurchaseCapiEventArgs): Promise<void> {
+  const { db, accountId, conversationId, opportunityId, amountEur, currencyCode, userData } = args
+  const eventId = `${opportunityId}:Purchase`
+
+  try {
+    const { error: claimError } = await db
+      .from('meta_capi_events')
+      .insert({ conversation_id: conversationId, event_name: 'Purchase', event_id: eventId, status: 'pending' })
+    if (claimError) {
+      if (isUniqueViolation(claimError)) return
+      console.error(`[meta capi] falha a reservar Purchase (opportunity=${opportunityId}):`, claimError.message)
+      return
+    }
+
+    const { data: aiConfig } = await db
+      .from('ai_configs')
+      .select('meta_capi_dataset_id, meta_capi_test_event_code')
+      .eq('account_id', accountId)
+      .maybeSingle()
+    const datasetId = (aiConfig as { meta_capi_dataset_id?: string | null } | null)?.meta_capi_dataset_id
+    if (!datasetId) {
+      console.error(`[meta capi] sem meta_capi_dataset_id (account=${accountId}) — Purchase não enviado.`)
+      await recordOutcome(db, eventId, 'error', null, 'dataset_not_configured')
+      return
+    }
+    const testEventCode = (aiConfig as { meta_capi_test_event_code?: string | null } | null)
+      ?.meta_capi_test_event_code
+
+    const { data: waConfig, error: waError } = await db
+      .from('whatsapp_config')
+      .select('access_token, waba_id')
+      .eq('account_id', accountId)
+      .maybeSingle()
+    const encryptedToken = (waConfig as { access_token?: string | null } | null)?.access_token
+    if (waError || !encryptedToken) {
+      console.error(`[meta capi] whatsapp_config não encontrado (account=${accountId}) — Purchase não enviado.`)
+      await recordOutcome(db, eventId, 'error', null, 'whatsapp_config_not_found')
+      return
+    }
+
+    let accessToken: string
+    try {
+      accessToken = decrypt(encryptedToken)
+    } catch (err) {
+      console.error('[meta capi] falha a decifrar o access_token do WhatsApp:', err)
+      await recordOutcome(db, eventId, 'error', null, 'access_token_decrypt_failed')
+      return
+    }
+
+    const eventBase: Record<string, unknown> = {
+      event_name: 'Purchase',
+      event_time: Math.floor(Date.now() / 1000),
+      event_id: eventId,
+      custom_data: { value: amountEur, currency: currencyCode },
+    }
+
+    if (userData.kind === 'ctwa') {
+      eventBase.action_source = 'business_messaging'
+      eventBase.messaging_channel = 'whatsapp'
+      eventBase.user_data = { ctwa_clid: userData.ctwaClid, whatsapp_business_account_id: userData.wabaId }
+    } else {
+      eventBase.action_source = 'system_generated'
+      eventBase.user_data = {
+        ...(userData.emailHash ? { em: [userData.emailHash] } : {}),
+        ...(userData.phoneHash ? { ph: [userData.phoneHash] } : {}),
+      }
+    }
+
+    const body: Record<string, unknown> = { data: [eventBase] }
+    if (testEventCode) body.test_event_code = testEventCode
+
+    let response: Response
+    try {
+      response = await fetch(`${META_API_BASE}/${datasetId}/events`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(CAPI_REQUEST_TIMEOUT_MS),
+      })
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      console.error(`[meta capi] falha a contactar a Conversions API (Purchase, opportunity=${opportunityId}):`, message)
+      await recordOutcome(db, eventId, 'error', null, truncate(`request_failed: ${message}`, RESPONSE_SUMMARY_MAX))
+      return
+    }
+
+    const responseText = await response.text().catch(() => '')
+    if (!response.ok) {
+      console.error(`[meta capi] a Meta respondeu ${response.status} ao Purchase (opportunity=${opportunityId}).`)
+      await recordOutcome(db, eventId, 'error', response.status, truncate(responseText, RESPONSE_SUMMARY_MAX))
+      return
+    }
+
+    await recordOutcome(db, eventId, 'sent', response.status, truncate(responseText, RESPONSE_SUMMARY_MAX))
+  } catch (err) {
+    console.error(
+      `[meta capi] erro inesperado a enviar Purchase (opportunity=${opportunityId}):`,
+      err instanceof Error ? err.message : err,
+    )
+    await recordOutcome(db, eventId, 'error', null, 'unexpected_error')
+  }
+}
