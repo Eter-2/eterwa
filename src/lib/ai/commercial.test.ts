@@ -1,79 +1,71 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
+import type { SupabaseClient } from '@supabase/supabase-js'
+
+vi.mock('@/lib/flows/meta-send', () => ({ engineSendText: vi.fn() }))
+vi.mock('@/lib/eter/followups', () => ({ scheduleAdLeadCadence: vi.fn() }))
+
 import {
-  personaFromAdId,
-  buildCommercialAdOpeningMessage,
-  COMMERCIAL_AD_PERSONA_BY_AD_ID,
+  DEFAULT_COMMERCIAL_WELCOME_MESSAGE,
+  DEFAULT_COMMERCIAL_FALLBACK_MESSAGE,
+  hasRecentCommercialFallback,
 } from './commercial'
 
 // ============================================================
-// Abertura por persona (Ricardo, 24/09/2026) — mapeamento ad_id →
-// persona e texto de abertura da primeira mensagem de uma conversa
-// vinda de anúncio. Ver src/lib/ai/commercial.ts e
-// dispatchInboundToAiReply (auto-reply.ts) para onde isto é usado.
+// Abertura única (Ricardo, 29/09/2026) e limite do fallback. O
+// comportamento de dispatch (sem IA no 1.º turno, cadência) está em
+// auto-reply.test.ts.
 // ============================================================
 
-describe('personaFromAdId', () => {
-  it('mapeia os anúncios actuais de CEO', () => {
-    expect(personaFromAdId('120249664433370585')).toBe('ceo')
-    expect(personaFromAdId('120249685585350585')).toBe('ceo')
-  })
-
-  it('mapeia o anúncio actual de director comercial', () => {
-    expect(personaFromAdId('120249664433640585')).toBe('director_comercial')
-  })
-
-  it('mapeia o anúncio actual de empresário', () => {
-    expect(personaFromAdId('120249664434280585')).toBe('empresario')
-  })
-
-  it('mapeia também os anúncios antigos ainda em posts activos', () => {
-    expect(personaFromAdId('120249645217990585')).toBe('ceo')
-    expect(personaFromAdId('120249645233150585')).toBe('director_comercial')
-    expect(personaFromAdId('120249645233480585')).toBe('empresario')
-  })
-
-  it('devolve null para um ad_id desconhecido', () => {
-    expect(personaFromAdId('000000000000000000')).toBeNull()
-  })
-
-  it('devolve null sem ad_id (null ou undefined)', () => {
-    expect(personaFromAdId(null)).toBeNull()
-    expect(personaFromAdId(undefined)).toBeNull()
+describe('DEFAULT_COMMERCIAL_WELCOME_MESSAGE', () => {
+  it('é exactamente o texto fixo aprovado, sem pergunta de cargo', () => {
+    expect(DEFAULT_COMMERCIAL_WELCOME_MESSAGE).toBe(
+      'Olá! Sou o agente de IA da Eter Growth, é exactamente isto que pomos a funcionar nas empresas: resposta em segundos, a qualquer hora. Conte-me em uma frase o que faz a sua empresa e mostro-lhe como ficaria no seu caso.',
+    )
+    expect(DEFAULT_COMMERCIAL_WELCOME_MESSAGE).not.toContain('\u2014')
   })
 })
 
-describe('buildCommercialAdOpeningMessage', () => {
-  it('usa a pergunta de CEO para um ad_id de CEO', () => {
-    const text = buildCommercialAdOpeningMessage('120249664433370585')
-    expect(text).toContain('Sou o agente da Eter Growth')
-    expect(text).toContain('é o responsável máximo da empresa, ou trata disto outra pessoa?')
-  })
-
-  it('usa a pergunta de director comercial para esse ad_id', () => {
-    const text = buildCommercialAdOpeningMessage('120249664433640585')
-    expect(text).toContain('é quem lidera a equipa comercial, ou trata disto outra pessoa?')
-  })
-
-  it('usa a pergunta de empresário para esse ad_id', () => {
-    const text = buildCommercialAdOpeningMessage('120249664434280585')
-    expect(text).toContain('a empresa é sua, ou trata disto outra pessoa?')
-  })
-
-  it('usa a pergunta genérica sem ad_id', () => {
-    const text = buildCommercialAdOpeningMessage(null)
-    expect(text).toContain('é o responsável comercial da empresa, ou trata disto por outra via?')
-  })
-
-  it('usa a pergunta genérica com um ad_id não mapeado', () => {
-    const text = buildCommercialAdOpeningMessage('999999999999999999')
-    expect(text).toContain('é o responsável comercial da empresa, ou trata disto por outra via?')
-  })
-
-  it('trata sempre por você, nunca por tu, e não usa travessão', () => {
-    for (const adId of [null, ...Object.keys(COMMERCIAL_AD_PERSONA_BY_AD_ID)]) {
-      const text = buildCommercialAdOpeningMessage(adId)
-      expect(text).not.toMatch(/\btu\b/i)
-      expect(text).not.toContain('—')
+function dbReturning(result: { data: unknown; error: { message: string } | null }) {
+  const calls: { method: string; args: unknown[] }[] = []
+  const chain: Record<string, unknown> = {}
+  for (const m of ['select', 'eq', 'gte']) {
+    chain[m] = (...args: unknown[]) => {
+      calls.push({ method: m, args })
+      return chain
     }
+  }
+  chain.limit = (...args: unknown[]) => {
+    calls.push({ method: 'limit', args })
+    return Promise.resolve(result)
+  }
+  return { db: { from: () => chain } as unknown as SupabaseClient, calls }
+}
+
+describe('hasRecentCommercialFallback', () => {
+  it('true quando há um fallback nas últimas 24h; a janela e o texto vêm no filtro', async () => {
+    const { db, calls } = dbReturning({ data: [{ id: 'm1' }], error: null })
+    const now = new Date('2026-09-29T12:00:00.000Z')
+    await expect(hasRecentCommercialFallback(db, 'conv-1', now)).resolves.toBe(true)
+    expect(calls).toContainEqual({
+      method: 'gte',
+      args: ['created_at', '2026-09-28T12:00:00.000Z'],
+    })
+    expect(calls).toContainEqual({
+      method: 'eq',
+      args: ['content_text', DEFAULT_COMMERCIAL_FALLBACK_MESSAGE],
+    })
+  })
+
+  it('false quando não há nenhum', async () => {
+    const { db } = dbReturning({ data: [], error: null })
+    await expect(hasRecentCommercialFallback(db, 'conv-1')).resolves.toBe(false)
+  })
+
+  it('erro de leitura conta como "não saiu" (regista e deixa passar)', async () => {
+    const { db } = dbReturning({ data: null, error: { message: 'boom' } })
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    await expect(hasRecentCommercialFallback(db, 'conv-1')).resolves.toBe(false)
+    expect(errorSpy).toHaveBeenCalled()
+    errorSpy.mockRestore()
   })
 })

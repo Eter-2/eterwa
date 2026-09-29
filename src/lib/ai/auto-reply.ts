@@ -165,7 +165,7 @@ export async function dispatchInboundToAiReply(
       // sendCommercialWelcomeIfNeeded's doc comment for why. Never
       // throws, so a send failure here still lets the AI reply below
       // attempt to run.
-      await sendCommercialWelcomeIfNeeded({
+      const welcomeSentNow = await sendCommercialWelcomeIfNeeded({
         db,
         accountId,
         conversationId,
@@ -173,8 +173,12 @@ export async function dispatchInboundToAiReply(
         configOwnerUserId,
         welcomeMessage: config.commercialWelcomeMessage,
         source: conv.source as string | null,
-        adId: conv.ad_id as string | null,
       })
+      // Sem IA no primeiro turno: se a abertura acabou de sair neste
+      // inbound, a IA (e o fallback) ficam para a mensagem seguinte do
+      // lead. A conversa, o contacto e o referral do anúncio já foram
+      // gravados pelo webhook antes de chegar aqui.
+      if (welcomeSentNow) return
     }
 
     const messages = await buildConversationContext(db, conversationId)
@@ -253,6 +257,7 @@ export async function dispatchInboundToAiReply(
           err instanceof Error ? err.message : err,
         )
         await sendCommercialFallback({
+          db,
           accountId,
           conversationId,
           contactId,
@@ -292,6 +297,7 @@ export async function dispatchInboundToAiReply(
         '[ai auto-reply] commercial mode: o modelo não devolveu texto — a enviar fallback.',
       )
       await sendCommercialFallback({
+        db,
         accountId,
         conversationId,
         contactId,

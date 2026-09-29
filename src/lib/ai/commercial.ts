@@ -1,5 +1,6 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { engineSendText } from '@/lib/flows/meta-send'
+import { scheduleAdLeadCadence } from '@/lib/eter/followups'
 import { normalizePhone, phonesMatch } from '@/lib/whatsapp/phone-utils'
 import type { AiConfig } from './types'
 
@@ -39,85 +40,18 @@ export function isCommercialConversation(
 }
 
 /**
- * Default welcome sent immediately on the first inbound message of a
- * commercial conversation, used whenever the account hasn't set its
- * own `commercial_welcome_message` AND the conversation didn't come
- * from a mapped Meta ad (see `buildCommercialAdOpeningMessage` below,
- * which takes priority for `source = 'meta_ad'`). Portuguese
- * (Portugal) — this is also the "boas-vindas adequada a quem acabou
- * de clicar no anúncio" required by Bloco 3-A.
+ * Abertura fixa, enviada de imediato na primeira mensagem de uma
+ * conversa comercial. É o texto único para conversas vindas de anúncio
+ * (`conversations.source = 'meta_ad'`) e também a boas-vindas por
+ * omissão das conversas directas sem `commercial_welcome_message`
+ * próprio. Sem pergunta de cargo e sem variação por anúncio (decisão do
+ * Ricardo, 29/09/2026). A IA só responde a partir da mensagem seguinte
+ * do lead (ver `dispatchInboundToAiReply`).
  */
 export const DEFAULT_COMMERCIAL_WELCOME_MESSAGE =
-  'Olá! Obrigado por nos contactar. 😊 ' +
-  'Somos a equipa comercial e estamos aqui para perceber melhor o seu negócio e ver como podemos ajudar. ' +
-  'Em que empresa ou projecto está, e que problema gostava de resolver?'
-
-// ============================================================
-// Abertura por persona — a primeira mensagem de uma conversa vinda de
-// anúncio (`conversations.source = 'meta_ad'`) confirma o cargo da
-// pessoa antes de qualificar, em vez de ir logo às perguntas de
-// negócio. O `ad_id` guardado na conversa (migração 045) identifica
-// qual dos anúncios abriu a conversa; cada anúncio testa uma persona
-// diferente (CEO / director comercial / empresário) — ver
-// `COMMERCIAL_AD_PERSONA_BY_AD_ID`. Texto aprovado pelo Ricardo,
-// 24/09/2026. Sem ad_id conhecido, usa-se a variante genérica.
-//
-// O cargo que a pessoa confirmar (ou corrigir) é registado por
-// save_lead_details no campo `role` → `contacts.lead_role` (migração
-// 058) — ver commercial-schema.ts / handlers/commercial.ts. Isto não
-// altera o gate de handoff (nome, email, motivo, empresa continuam
-// obrigatórios).
-// ============================================================
-
-export type CommercialAdPersona = 'ceo' | 'director_comercial' | 'empresario'
-
-/** ad_id (`conversations.ad_id`) → persona testada nesse anúncio.
- *  Inclui os anúncios actuais e os antigos ainda em posts activos. */
-export const COMMERCIAL_AD_PERSONA_BY_AD_ID: Record<string, CommercialAdPersona> = {
-  '120249664433370585': 'ceo',
-  '120249685585350585': 'ceo',
-  '120249645217990585': 'ceo',
-  '120249664433640585': 'director_comercial',
-  '120249645233150585': 'director_comercial',
-  '120249664434280585': 'empresario',
-  '120249645233480585': 'empresario',
-}
-
-/** Pergunta de confirmação de cargo por persona, usada na abertura da
- *  conversa (ver `buildCommercialAdOpeningMessage`). Sem persona
- *  conhecida (ad_id em falta ou não mapeado), usa-se a genérica. */
-const COMMERCIAL_AD_PERSONA_QUESTION: Record<CommercialAdPersona, string> = {
-  ceo: 'é o responsável máximo da empresa, ou trata disto outra pessoa?',
-  director_comercial: 'é quem lidera a equipa comercial, ou trata disto outra pessoa?',
-  empresario: 'a empresa é sua, ou trata disto outra pessoa?',
-}
-const COMMERCIAL_AD_PERSONA_QUESTION_GENERIC =
-  'é o responsável comercial da empresa, ou trata disto por outra via?'
-
-/** Persona testada pelo anúncio que abriu a conversa, ou `null` sem
- *  `ad_id` ou com um `ad_id` não mapeado. */
-export function personaFromAdId(adId: string | null | undefined): CommercialAdPersona | null {
-  if (!adId) return null
-  return COMMERCIAL_AD_PERSONA_BY_AD_ID[adId] ?? null
-}
-
-/**
- * Abertura da primeira mensagem de uma conversa comercial vinda de
- * anúncio (`conversations.source === 'meta_ad'`) — substitui, só para
- * este caso, `DEFAULT_COMMERCIAL_WELCOME_MESSAGE` e qualquer
- * `commercial_welcome_message` configurado na conta (a confirmação de
- * cargo é sempre a prioridade quando se sabe que a pessoa veio de um
- * anúncio). Chamar apenas quando `source === 'meta_ad'` — ver
- * `sendCommercialWelcomeIfNeeded`.
- */
-export function buildCommercialAdOpeningMessage(adId: string | null | undefined): string {
-  const persona = personaFromAdId(adId)
-  const question = persona ? COMMERCIAL_AD_PERSONA_QUESTION[persona] : COMMERCIAL_AD_PERSONA_QUESTION_GENERIC
-  return (
-    'Olá! Sou o agente da Eter Growth. Respondo em segundos, a qualquer hora, é isto que fazemos pelas empresas.\n' +
-    `Para lhe dar a resposta certa: ${question}`
-  )
-}
+  'Olá! Sou o agente de IA da Eter Growth, é exactamente isto que pomos a funcionar nas empresas: ' +
+  'resposta em segundos, a qualquer hora. Conte-me em uma frase o que faz a sua empresa e ' +
+  'mostro-lhe como ficaria no seu caso.'
 
 /**
  * Fixed fallback sent when the AI call fails, times out, or returns no
@@ -137,14 +71,10 @@ interface WelcomeArgs {
   contactId: string
   configOwnerUserId: string
   welcomeMessage: string | null | undefined
-  /** `conversations.source` (migração 045) — quando `'meta_ad'`, a
-   *  abertura por persona (`buildCommercialAdOpeningMessage`) tem
-   *  sempre prioridade sobre `welcomeMessage`. */
+  /** `conversations.source` (migração 045). Quando `'meta_ad'`, a abertura é
+   *  sempre o texto fixo (ignora `welcomeMessage`) e agenda-se a cadência
+   *  de follow-up dos leads de anúncio. */
   source?: string | null
-  /** `conversations.ad_id` (migração 045) — qual anúncio abriu a
-   *  conversa, usado para escolher a persona da abertura. Só relevante
-   *  quando `source === 'meta_ad'`. */
-  adId?: string | null
 }
 
 /**
@@ -165,10 +95,12 @@ interface WelcomeArgs {
  * comment) — so two inbound messages landing close together, or a
  * webhook retry, can never send this twice. Never throws: a failure
  * here must not block the rest of the auto-reply flow.
+ *
+ * Devolve `true` só quando a abertura foi enviada AGORA, neste inbound;
+ * o chamador não deve então correr a IA (nem o fallback) neste turno.
  */
-export async function sendCommercialWelcomeIfNeeded(args: WelcomeArgs): Promise<void> {
-  const { db, accountId, conversationId, contactId, configOwnerUserId, welcomeMessage, source, adId } =
-    args
+export async function sendCommercialWelcomeIfNeeded(args: WelcomeArgs): Promise<boolean> {
+  const { db, accountId, conversationId, contactId, configOwnerUserId, welcomeMessage, source } = args
   try {
     const { data: claimedRows, error } = await db
       .from('conversations')
@@ -182,20 +114,18 @@ export async function sendCommercialWelcomeIfNeeded(args: WelcomeArgs): Promise<
         '[ai auto-reply] commercial welcome: falha ao reservar o envio único:',
         error.message,
       )
-      return
+      return false
     }
-    if (!claimedRows || claimedRows.length === 0) return // already sent, or lost the race
+    if (!claimedRows || claimedRows.length === 0) return false // already sent, or lost the race
 
-    // Abertura por persona (Ricardo, 24/09/2026): uma conversa vinda de
-    // um anúncio confirma o cargo antes de qualificar, independentemente
-    // de a conta ter um `commercial_welcome_message` próprio — esse
-    // continua a valer para conversas directas (source !== 'meta_ad').
+    // Conversa vinda de anúncio: texto fixo, independentemente de a
+    // conta ter um `commercial_welcome_message` próprio (esse continua a
+    // valer para conversas directas, source !== 'meta_ad').
+    const isAdLead = source === 'meta_ad'
     const text =
-      source === 'meta_ad'
-        ? buildCommercialAdOpeningMessage(adId)
-        : welcomeMessage && welcomeMessage.trim()
-          ? welcomeMessage.trim()
-          : DEFAULT_COMMERCIAL_WELCOME_MESSAGE
+      !isAdLead && welcomeMessage && welcomeMessage.trim()
+        ? welcomeMessage.trim()
+        : DEFAULT_COMMERCIAL_WELCOME_MESSAGE
 
     await engineSendText({
       accountId,
@@ -205,30 +135,85 @@ export async function sendCommercialWelcomeIfNeeded(args: WelcomeArgs): Promise<
       text,
       aiGenerated: false,
     })
+
+    if (isAdLead) {
+      // Cadência de follow-up para todos os leads de anúncio. Best-effort:
+      // uma falha aqui nunca desfaz a abertura já enviada.
+      try {
+        await scheduleAdLeadCadence(db, accountId, { conversationId, contactId })
+      } catch (err) {
+        console.error(
+          '[ai auto-reply] commercial welcome: falha ao agendar a cadência do lead de anúncio:',
+          err instanceof Error ? err.message : err,
+        )
+      }
+    }
+    return true
   } catch (err) {
     console.error(
       '[ai auto-reply] commercial welcome send failed:',
       err instanceof Error ? err.message : err,
     )
+    return false
   }
 }
 
 interface FallbackArgs {
+  db: SupabaseClient
   accountId: string
   conversationId: string
   contactId: string
   configOwnerUserId: string
 }
 
+const FALLBACK_COOLDOWN_MS = 24 * 60 * 60 * 1000
+
+/** True se o fallback fixo já saiu nesta conversa nas últimas 24h.
+ *  Lê `messages` (o envio grava-se lá com este mesmo texto), por isso
+ *  não precisa de coluna nova. Erro de leitura conta como "não saiu"
+ *  (regista e deixa passar: o fallback é a rede de segurança). */
+export async function hasRecentCommercialFallback(
+  db: SupabaseClient,
+  conversationId: string,
+  now: Date = new Date(),
+): Promise<boolean> {
+  const since = new Date(now.getTime() - FALLBACK_COOLDOWN_MS).toISOString()
+  const { data, error } = await db
+    .from('messages')
+    .select('id')
+    .eq('conversation_id', conversationId)
+    .eq('sender_type', 'bot')
+    .eq('content_text', DEFAULT_COMMERCIAL_FALLBACK_MESSAGE)
+    .gte('created_at', since)
+    .limit(1)
+  if (error) {
+    console.error(
+      '[ai auto-reply] commercial fallback: falha a verificar o limite de 24h:',
+      error.message,
+    )
+    return false
+  }
+  return Array.isArray(data) && data.length > 0
+}
+
 /**
  * Guaranteed reply for commercial mode when the AI call fails, times
- * out, or returns no usable text (see dispatchInboundToAiReply). Never
- * throws — callers treat this as best-effort, same discipline as the
- * rest of the auto-reply / webhook cascade.
+ * out, or returns no usable text (see dispatchInboundToAiReply). Sai no
+ * máximo uma vez por conversa em cada 24h, para não haver cadeias de
+ * "Recebemos a sua mensagem" seguidas; se já saiu, regista o erro e não
+ * envia nada. Never throws — callers treat this as best-effort, same
+ * discipline as the rest of the auto-reply / webhook cascade.
+ * Devolve `true` se enviou.
  */
-export async function sendCommercialFallback(args: FallbackArgs): Promise<void> {
-  const { accountId, conversationId, contactId, configOwnerUserId } = args
+export async function sendCommercialFallback(args: FallbackArgs): Promise<boolean> {
+  const { db, accountId, conversationId, contactId, configOwnerUserId } = args
   try {
+    if (await hasRecentCommercialFallback(db, conversationId)) {
+      console.error(
+        '[ai auto-reply] commercial fallback: já saiu nas últimas 24h nesta conversa, não envia outro.',
+      )
+      return false
+    }
     await engineSendText({
       accountId,
       userId: configOwnerUserId,
@@ -237,10 +222,12 @@ export async function sendCommercialFallback(args: FallbackArgs): Promise<void> 
       text: DEFAULT_COMMERCIAL_FALLBACK_MESSAGE,
       aiGenerated: false,
     })
+    return true
   } catch (err) {
     console.error(
       '[ai auto-reply] commercial fallback send failed:',
       err instanceof Error ? err.message : err,
     )
+    return false
   }
 }

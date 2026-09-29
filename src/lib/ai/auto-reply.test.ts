@@ -10,6 +10,7 @@ const h = vi.hoisted(() => ({
   generateReply: vi.fn(),
   generateReplyWithTools: vi.fn(),
   engineSendText: vi.fn(),
+  scheduleAdLeadCadence: vi.fn(),
   notifyHandoff: vi.fn().mockResolvedValue({
     mattermost: { sent: true, via: 'webhook' },
     whatsapp: [{ sent: true, via: 'text' }],
@@ -24,6 +25,9 @@ const h = vi.hoisted(() => ({
     // (WHERE commercial_welcome_sent_at IS NULL) wins the race. false
     // simulates "already sent" / "lost the race".
     welcomeClaimed: true as boolean,
+    // Se o fallback fixo já saiu nesta conversa nas últimas 24h
+    // (consulta a `messages` em hasRecentCommercialFallback).
+    recentFallbackExists: false as boolean,
     // The contact's phone number, looked up by dispatchInboundToAiReply
     // to decide team-list membership (isCommercialConversation).
     contactPhone: '351911111111' as string | null,
@@ -59,6 +63,9 @@ vi.mock('./tools/handlers/commercial', () => ({
   createCommercialToolExecutor: vi.fn(() => vi.fn()),
 }))
 vi.mock('@/lib/flows/meta-send', () => ({ engineSendText: h.engineSendText }))
+vi.mock('@/lib/eter/followups', () => ({
+  scheduleAdLeadCadence: h.scheduleAdLeadCadence,
+}))
 vi.mock('@/lib/notifications/notify-team', () => ({ notifyHandoff: h.notifyHandoff }))
 vi.mock('./admin-client', () => ({
   supabaseAdmin: () => ({
@@ -71,6 +78,20 @@ vi.mock('./admin-client', () => ({
           in: () => chain,
           limit: () =>
             Promise.resolve({ data: h.state.autoResponders, error: null }),
+        }
+        return chain
+      }
+      if (table === 'messages') {
+        // .select().eq().eq().eq().gte().limit() → fallback recente?
+        const chain: Record<string, unknown> = {
+          select: () => chain,
+          eq: () => chain,
+          gte: () => chain,
+          limit: () =>
+            Promise.resolve({
+              data: h.state.recentFallbackExists ? [{ id: 'msg-fb' }] : [],
+              error: null,
+            }),
         }
         return chain
       }
@@ -143,6 +164,7 @@ vi.mock('./admin-client', () => ({
 }))
 
 import { dispatchInboundToAiReply } from './auto-reply'
+import { DEFAULT_COMMERCIAL_WELCOME_MESSAGE, DEFAULT_COMMERCIAL_FALLBACK_MESSAGE } from './commercial'
 
 const ARGS = {
   accountId: 'acct-1',
@@ -184,7 +206,13 @@ beforeEach(() => {
   h.state.claim = true
   h.state.updatePayload = null
   h.state.rpcCalls = []
-  h.state.welcomeClaimed = true
+  // Por omissão a conversa já foi cumprimentada (abertura enviada num
+  // turno anterior), por isso a IA corre neste turno. Os testes da
+  // abertura ligam `welcomeClaimed = true` explicitamente.
+  h.state.welcomeClaimed = false
+  h.state.recentFallbackExists = false
+  h.scheduleAdLeadCadence.mockReset()
+  h.scheduleAdLeadCadence.mockResolvedValue(undefined)
   h.state.contactPhone = '351911111111'
   h.state.contactName = 'Ricardo Contacto'
   h.state.contactEmail = 'contacto@example.com'
@@ -480,9 +508,8 @@ describe('dispatchInboundToAiReply — Bloco 3-A modo comercial por omissão', (
     h.state.conv = commercialConv({ source: 'direct' })
     h.loadAiConfig.mockResolvedValue(commercialConfig())
     await dispatchInboundToAiReply(ARGS)
-    // Duas mensagens: a boas-vindas comercial + a resposta substantiva,
-    // exactamente como uma conversa vinda do anúncio.
-    expect(h.engineSendText).toHaveBeenCalledTimes(2)
+    // Conversa já cumprimentada: só a resposta substantiva da IA.
+    expect(h.engineSendText).toHaveBeenCalledTimes(1)
     expect(h.generateReply).not.toHaveBeenCalled()
     expect(h.generateReplyWithTools).toHaveBeenCalledTimes(1)
   })
@@ -545,32 +572,29 @@ describe('dispatchInboundToAiReply — Bloco 3-A modo comercial por omissão', (
     expect(h.generateReply).toHaveBeenCalledTimes(1)
   })
 
-  it('sends the immediate welcome message before generating the AI reply, then still sends the AI reply', async () => {
-    // source 'direct' — a abertura por persona (ad_id) só se aplica a
-    // conversas vindas de anúncio; ver bloco "abertura por persona"
-    // abaixo para o caso source 'meta_ad'.
+  it('primeiro turno: envia só a abertura fixa e NÃO chama a IA nem o fallback (conversa directa)', async () => {
     h.state.conv = commercialConv({ source: 'direct' })
+    h.state.welcomeClaimed = true
     h.loadAiConfig.mockResolvedValue(commercialConfig())
     await dispatchInboundToAiReply(ARGS)
 
-    // Two sends: the instant welcome, then the substantive AI reply.
-    expect(h.engineSendText).toHaveBeenCalledTimes(2)
-    expect(h.engineSendText).toHaveBeenNthCalledWith(
-      1,
+    expect(h.engineSendText).toHaveBeenCalledTimes(1)
+    expect(h.engineSendText).toHaveBeenCalledWith(
       expect.objectContaining({
         conversationId: 'conv-1',
         aiGenerated: false,
-        text: expect.stringContaining('Obrigado por nos contactar'),
+        text: DEFAULT_COMMERCIAL_WELCOME_MESSAGE,
       }),
     )
-    expect(h.engineSendText).toHaveBeenNthCalledWith(
-      2,
-      expect.objectContaining({ text: 'Hello!', aiGenerated: true }),
-    )
+    expect(h.generateReplyWithTools).not.toHaveBeenCalled()
+    expect(h.generateReply).not.toHaveBeenCalled()
+    // Conversa directa: sem cadência de anúncio.
+    expect(h.scheduleAdLeadCadence).not.toHaveBeenCalled()
   })
 
   it('uses the configured commercial_welcome_message instead of the default when set (conversa directa)', async () => {
     h.state.conv = commercialConv({ source: 'direct' })
+    h.state.welcomeClaimed = true
     h.loadAiConfig.mockResolvedValue(
       commercialConfig({ commercialWelcomeMessage: 'Olá! Mensagem à medida.' }),
     )
@@ -582,47 +606,99 @@ describe('dispatchInboundToAiReply — Bloco 3-A modo comercial por omissão', (
   })
 
   // ============================================================
-  // Abertura por persona (Ricardo, 24/09/2026) — uma conversa vinda de
-  // anúncio (source 'meta_ad') confirma o cargo com base no ad_id
-  // guardado na conversa, em vez de ir logo às perguntas de
-  // qualificação. Ver src/lib/ai/commercial.ts.
+  // Abertura única (Ricardo, 29/09/2026) — conversas de anúncio
+  // (source 'meta_ad') recebem sempre o mesmo texto fixo, sem pergunta
+  // de cargo e sem variação por anúncio, e a IA só responde a partir
+  // da mensagem seguinte do lead.
   // ============================================================
-  it('conversa de anúncio com ad_id mapeado para "director comercial" usa essa variante da abertura', async () => {
-    h.state.conv = commercialConv({ source: 'meta_ad', ad_id: '120249664433640585' })
-    h.loadAiConfig.mockResolvedValue(commercialConfig())
-    await dispatchInboundToAiReply(ARGS)
-    expect(h.engineSendText).toHaveBeenNthCalledWith(
-      1,
-      expect.objectContaining({
-        text: expect.stringContaining('é quem lidera a equipa comercial, ou trata disto outra pessoa?'),
-      }),
-    )
+  it('conversa de anúncio: abertura fixa igual para qualquer ad_id e sem pergunta de cargo', async () => {
+    for (const adId of [null, '120249664433640585', '999999999999999999']) {
+      h.engineSendText.mockClear()
+      h.state.conv = commercialConv({ source: 'meta_ad', ad_id: adId })
+      h.state.welcomeClaimed = true
+      h.loadAiConfig.mockResolvedValue(commercialConfig())
+      await dispatchInboundToAiReply(ARGS)
+      expect(h.engineSendText).toHaveBeenCalledTimes(1)
+      const { text } = h.engineSendText.mock.calls[0][0] as { text: string }
+      expect(text).toBe(DEFAULT_COMMERCIAL_WELCOME_MESSAGE)
+      expect(text).not.toMatch(/responsável|cargo|trata disto/)
+      expect(text).not.toContain('\u2014')
+    }
   })
 
-  it('conversa de anúncio sem ad_id conhecido usa a pergunta genérica de confirmação de cargo', async () => {
+  it('conversa de anúncio ignora o commercial_welcome_message configurado', async () => {
     h.state.conv = commercialConv({ source: 'meta_ad', ad_id: null })
-    h.loadAiConfig.mockResolvedValue(commercialConfig())
-    await dispatchInboundToAiReply(ARGS)
-    expect(h.engineSendText).toHaveBeenNthCalledWith(
-      1,
-      expect.objectContaining({
-        text: expect.stringContaining('é o responsável comercial da empresa, ou trata disto por outra via?'),
-      }),
-    )
-  })
-
-  it('conversa de anúncio ignora o commercial_welcome_message configurado — a abertura por persona tem prioridade', async () => {
-    h.state.conv = commercialConv({ source: 'meta_ad', ad_id: null })
+    h.state.welcomeClaimed = true
     h.loadAiConfig.mockResolvedValue(
       commercialConfig({ commercialWelcomeMessage: 'Olá! Mensagem à medida.' }),
     )
     await dispatchInboundToAiReply(ARGS)
-    expect(h.engineSendText).toHaveBeenNthCalledWith(
-      1,
-      expect.objectContaining({
-        text: expect.stringContaining('Sou o agente da Eter Growth'),
-      }),
+    expect(h.engineSendText).toHaveBeenCalledWith(
+      expect.objectContaining({ text: DEFAULT_COMMERCIAL_WELCOME_MESSAGE }),
     )
+  })
+
+  it('sem IA no primeiro turno: com a abertura enviada agora não chama a IA nem o fallback, mesmo que a IA falhasse', async () => {
+    h.state.conv = commercialConv({ source: 'meta_ad' })
+    h.state.welcomeClaimed = true
+    h.loadAiConfig.mockResolvedValue(commercialConfig())
+    h.generateReplyWithTools.mockRejectedValue(new Error('provider timed out'))
+    await dispatchInboundToAiReply(ARGS)
+
+    expect(h.generateReplyWithTools).not.toHaveBeenCalled()
+    expect(h.buildConversationContext).not.toHaveBeenCalled()
+    expect(h.engineSendText).toHaveBeenCalledTimes(1) // só a abertura
+    expect(h.state.rpcCalls.some((c) => c.name === 'claim_ai_reply_slot')).toBe(false)
+  })
+
+  it('a IA responde a partir da mensagem seguinte (abertura já enviada)', async () => {
+    h.state.conv = commercialConv({
+      source: 'meta_ad',
+      commercial_welcome_sent_at: '2026-09-29T10:00:00.000Z',
+    })
+    h.state.welcomeClaimed = false
+    h.loadAiConfig.mockResolvedValue(commercialConfig())
+    await dispatchInboundToAiReply(ARGS)
+
+    expect(h.generateReplyWithTools).toHaveBeenCalledTimes(1)
+    expect(h.engineSendText).toHaveBeenCalledTimes(1)
+    expect(h.engineSendText).toHaveBeenCalledWith(
+      expect.objectContaining({ text: 'Hello!', aiGenerated: true }),
+    )
+    expect(h.scheduleAdLeadCadence).not.toHaveBeenCalled()
+  })
+
+  it('cadência: ao enviar a abertura a uma conversa meta_ad agenda a cadência (uma vez, com conversa e contacto)', async () => {
+    h.state.conv = commercialConv({ source: 'meta_ad' })
+    h.state.welcomeClaimed = true
+    h.loadAiConfig.mockResolvedValue(commercialConfig())
+    await dispatchInboundToAiReply(ARGS)
+
+    expect(h.scheduleAdLeadCadence).toHaveBeenCalledTimes(1)
+    expect(h.scheduleAdLeadCadence).toHaveBeenCalledWith(expect.anything(), 'acct-1', {
+      conversationId: 'conv-1',
+      contactId: 'contact-1',
+    })
+  })
+
+  it('cadência: se perder a corrida do envio único (abertura já enviada) não agenda nada', async () => {
+    h.state.conv = commercialConv({ source: 'meta_ad' })
+    h.state.welcomeClaimed = false
+    h.loadAiConfig.mockResolvedValue(commercialConfig())
+    await dispatchInboundToAiReply(ARGS)
+    expect(h.scheduleAdLeadCadence).not.toHaveBeenCalled()
+  })
+
+  it('cadência: uma falha a agendar não desfaz a abertura nem chama a IA', async () => {
+    h.state.conv = commercialConv({ source: 'meta_ad' })
+    h.state.welcomeClaimed = true
+    h.loadAiConfig.mockResolvedValue(commercialConfig())
+    h.scheduleAdLeadCadence.mockRejectedValue(new Error('db down'))
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    await dispatchInboundToAiReply(ARGS)
+    expect(h.engineSendText).toHaveBeenCalledTimes(1)
+    expect(h.generateReplyWithTools).not.toHaveBeenCalled()
+    errorSpy.mockRestore()
   })
 
   it('does not resend the welcome once commercial_welcome_sent_at is already set', async () => {
@@ -662,11 +738,11 @@ describe('dispatchInboundToAiReply — Bloco 3-A modo comercial por omissão', (
 
     await dispatchInboundToAiReply(ARGS)
 
-    // Welcome + fallback — both sends land, nothing throws out of
-    // dispatchInboundToAiReply (it must never throw).
-    expect(h.engineSendText).toHaveBeenCalledTimes(2)
+    // Só o fallback sai (a abertura foi enviada num turno anterior) e
+    // nada rebenta fora de dispatchInboundToAiReply (nunca lança).
+    expect(h.engineSendText).toHaveBeenCalledTimes(1)
     expect(h.engineSendText).toHaveBeenNthCalledWith(
-      2,
+      1,
       expect.objectContaining({
         aiGenerated: false,
         text: expect.stringContaining('Recebemos a sua mensagem'),
@@ -675,6 +751,47 @@ describe('dispatchInboundToAiReply — Bloco 3-A modo comercial por omissão', (
     // The reply-cap RPC is never reached on the failure path (only the
     // two rate-limit checks run before it).
     expect(h.state.rpcCalls.some((c) => c.name === 'claim_ai_reply_slot')).toBe(false)
+    errorSpy.mockRestore()
+  })
+
+  it('fallback: no máximo 1x por 24h por conversa, se já saiu regista o erro e não envia nada', async () => {
+    h.state.conv = commercialConv()
+    h.state.recentFallbackExists = true
+    h.loadAiConfig.mockResolvedValue(commercialConfig())
+    h.generateReplyWithTools.mockRejectedValue(new Error('provider timed out'))
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    await dispatchInboundToAiReply(ARGS)
+
+    expect(h.engineSendText).not.toHaveBeenCalled()
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('já saiu nas últimas 24h'))
+    errorSpy.mockRestore()
+  })
+
+  it('fallback: sem fallback recente envia-o, e o mesmo limite vale para o caminho "modelo sem texto"', async () => {
+    h.state.conv = commercialConv()
+    h.loadAiConfig.mockResolvedValue(commercialConfig())
+    h.generateReplyWithTools.mockResolvedValue({
+      text: '',
+      handoff: false,
+      usage: null,
+      iterations: 1,
+      hitIterationLimit: false,
+    })
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    await dispatchInboundToAiReply(ARGS)
+    expect(h.engineSendText).toHaveBeenCalledTimes(1)
+    expect(h.engineSendText).toHaveBeenCalledWith(
+      expect.objectContaining({ text: DEFAULT_COMMERCIAL_FALLBACK_MESSAGE }),
+    )
+
+    h.engineSendText.mockClear()
+    h.state.recentFallbackExists = true
+    await dispatchInboundToAiReply(ARGS)
+    expect(h.engineSendText).not.toHaveBeenCalled()
+    warnSpy.mockRestore()
     errorSpy.mockRestore()
   })
 
@@ -692,9 +809,9 @@ describe('dispatchInboundToAiReply — Bloco 3-A modo comercial por omissão', (
 
     await dispatchInboundToAiReply(ARGS)
 
-    expect(h.engineSendText).toHaveBeenCalledTimes(2)
+    expect(h.engineSendText).toHaveBeenCalledTimes(1)
     expect(h.engineSendText).toHaveBeenNthCalledWith(
-      2,
+      1,
       expect.objectContaining({ text: expect.stringContaining('Recebemos a sua mensagem') }),
     )
     warnSpy.mockRestore()
@@ -715,9 +832,9 @@ describe('dispatchInboundToAiReply — Bloco 3-A modo comercial por omissão', (
 
     // The welcome went out, then the handoff notice (never a silent
     // handoff) — but no extra fallback beyond those two.
-    expect(h.engineSendText).toHaveBeenCalledTimes(2)
+    expect(h.engineSendText).toHaveBeenCalledTimes(1)
     expect(h.engineSendText).toHaveBeenNthCalledWith(
-      2,
+      1,
       expect.objectContaining({
         aiGenerated: false,
         text: 'Vou pedir a alguém da equipa que lhe responda. Fique atento, respondemos por aqui.',
@@ -825,9 +942,9 @@ describe('dispatchInboundToAiReply — Bloco 3-A trava do handoff (nome, email, 
 
     // Boas-vindas + o pedido do que falta — nunca a mensagem fixa de
     // handoff.
-    expect(h.engineSendText).toHaveBeenCalledTimes(2)
+    expect(h.engineSendText).toHaveBeenCalledTimes(1)
     expect(h.engineSendText).toHaveBeenNthCalledWith(
-      2,
+      1,
       expect.objectContaining({
         aiGenerated: false,
         text: expect.stringContaining('o seu email'),
@@ -845,7 +962,7 @@ describe('dispatchInboundToAiReply — Bloco 3-A trava do handoff (nome, email, 
     await dispatchInboundToAiReply(ARGS)
 
     expect(h.engineSendText).toHaveBeenNthCalledWith(
-      2,
+      1,
       expect.objectContaining({ text: expect.stringContaining('o seu nome') }),
     )
     expect(h.state.updatePayload).not.toHaveProperty('ai_autoreply_disabled')
@@ -858,7 +975,7 @@ describe('dispatchInboundToAiReply — Bloco 3-A trava do handoff (nome, email, 
     await dispatchInboundToAiReply(ARGS)
 
     expect(h.engineSendText).toHaveBeenNthCalledWith(
-      2,
+      1,
       expect.objectContaining({ text: expect.stringContaining('o motivo do que precisa') }),
     )
     expect(h.state.updatePayload).not.toHaveProperty('ai_autoreply_disabled')
@@ -872,7 +989,7 @@ describe('dispatchInboundToAiReply — Bloco 3-A trava do handoff (nome, email, 
     await dispatchInboundToAiReply(ARGS)
 
     expect(h.engineSendText).toHaveBeenNthCalledWith(
-      2,
+      1,
       expect.objectContaining({ text: expect.stringContaining('o nome da empresa') }),
     )
     expect(h.state.updatePayload).toEqual({ handoff_blocked_attempts: 1 })
@@ -886,9 +1003,9 @@ describe('dispatchInboundToAiReply — Bloco 3-A trava do handoff (nome, email, 
 
     await dispatchInboundToAiReply(ARGS)
 
-    expect(h.engineSendText).toHaveBeenCalledTimes(2)
+    expect(h.engineSendText).toHaveBeenCalledTimes(1)
     expect(h.engineSendText).toHaveBeenNthCalledWith(
-      2,
+      1,
       expect.objectContaining({
         text: 'Vou pedir a alguém da equipa que lhe responda. Fique atento, respondemos por aqui.',
       }),
@@ -933,7 +1050,7 @@ describe('dispatchInboundToAiReply — Bloco 3-A trava do handoff (nome, email, 
     h.state.conv = commercialConv({ escalation_reason: null, handoff_blocked_attempts: 0 })
     await dispatchInboundToAiReply(ARGS)
     expect(h.state.updatePayload).toEqual({ handoff_blocked_attempts: 1 })
-    expect(h.engineSendText).toHaveBeenCalledTimes(2) // boas-vindas + pedido
+    expect(h.engineSendText).toHaveBeenCalledTimes(1) // só o pedido
 
     // 2ª tentativa — ainda bloqueada, conta sobe para 2. A boas-vindas
     // já foi enviada na conversa real, por isso já não repete aqui.

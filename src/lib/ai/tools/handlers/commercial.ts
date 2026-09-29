@@ -250,9 +250,8 @@ export async function saveLeadDetailsHandler(
       if (name) contactUpdate.name = name
       if (email) contactUpdate.email = email
       if (company) contactUpdate.company = company
-      // `contacts.lead_role` (migração 058) — cargo confirmado (ou
-      // corrigido) pelo lead na abertura por persona, ver
-      // buildCommercialAdOpeningMessage (commercial.ts). Nunca bloqueia
+      // `contacts.lead_role` (migração 058) — cargo que o lead
+      // indicar ou corrigir durante a conversa. Nunca bloqueia
       // o gate de handoff (checkHandoffReadiness não olha para isto).
       if (role) contactUpdate.lead_role = role
       const { error } = await ctx.db.from('contacts').update(contactUpdate).eq('id', ctx.contactId)

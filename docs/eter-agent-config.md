@@ -240,6 +240,13 @@ Ambas opcionais — têm defaults sensatos em `src/lib/ai/defaults.ts`.
 # `runOpenAiToolLoop`). Default: 6.
 AI_MAX_TOOL_ITERATIONS=6
 
+# Timeout por turno do agente, em ms (`aiRequestTimeoutMs`, defaults.ts).
+# No provider claude-agent-sdk cobre o tool loop inteiro (`query()` corre
+# todas as voltas internamente; ver `consumeQueryWithTimeout`). Default:
+# 30000, mas o Sonnet demora 24-33 s, por isso em producao usa-se 60000.
+# (`.env.local.example` nao pode ser editado por esta via, documentado aqui.)
+AI_REQUEST_TIMEOUT_MS=60000
+
 # Orçamento de wall-clock por chamada individual a uma ferramenta antes
 # de devolver um erro ao modelo (nunca deixa a conversa pendurada).
 # Default: 10000 (10s).
@@ -289,6 +296,20 @@ Duas peças novas, ligadas ao webhook inbound do WhatsApp
    Sem o template aprovado correspondente, a linha fica `failed` com o
    motivo em `agent_scheduled_messages.error` — nunca envia texto livre
    fora da janela, nunca falha em silêncio.
+
+   **Cadência dos leads de anúncio (29/09/2026).** Ao enviar a abertura
+   fixa a uma conversa `source = 'meta_ad'`, `scheduleAdLeadCadence`
+   agenda 2 linhas (reutiliza os kinds `follow_up_1d` / `follow_up_3d`,
+   sem migração; o conteúdo vem do `payload`):
+
+   - T+22h: texto livre "Olá! Ficou alguma dúvida? ..." (dentro da janela).
+   - T+3 dias: template Meta `eter_reativacao_v1`, `pt_PT`, 1 variável de
+     corpo `{{1}}` = primeiro nome do contacto (fallback `olá`), enviado
+     sempre como template (`payload.template`). Precisa de estar
+     APPROVED na conta, senão a linha fica `failed` com erro claro.
+
+   Qualquer inbound cancela ambas (`cancelFollowUpCadence`). Sem
+   backfill de conversas antigas. Não há passo T+7.
 
 ## AI SDR — aprovação de decisões via WhatsApp (042_aisdr_approval_forward_queue.sql)
 
