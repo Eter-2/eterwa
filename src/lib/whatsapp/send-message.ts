@@ -522,16 +522,36 @@ export async function sendMessageToConversation(
   // não volta a ligar-se sozinho — e best-effort, como o pause-flows
   // acima: uma falha aqui não pode transformar um envio bem-sucedido
   // num erro para o agente humano.
+  //
+  // Excepção: templates (outreach do AI SDR ou da equipa) NÃO calam a
+  // IA. Um template é a abertura fora da janela de 24h; quando o
+  // contacto responde, a Vera tem de continuar a conversa. Em vez
+  // disso, marca-se a abertura fixa como já enviada, para nunca
+  // perguntar "com quem estou a falar?" a quem já tratámos pelo nome.
   try {
-    const { error: disableErr } = await db
-      .from('conversations')
-      .update({ ai_autoreply_disabled: true })
-      .eq('id', conversationId);
-    if (disableErr) {
-      console.error(
-        '[ai auto-reply] disable-on-agent-send failed:',
-        disableErr.message
-      );
+    if (messageType === 'template') {
+      const { error: welcomeErr } = await db
+        .from('conversations')
+        .update({ commercial_welcome_sent_at: new Date().toISOString() })
+        .eq('id', conversationId)
+        .is('commercial_welcome_sent_at', null);
+      if (welcomeErr) {
+        console.error(
+          '[ai auto-reply] mark-welcome-on-template failed:',
+          welcomeErr.message
+        );
+      }
+    } else {
+      const { error: disableErr } = await db
+        .from('conversations')
+        .update({ ai_autoreply_disabled: true })
+        .eq('id', conversationId);
+      if (disableErr) {
+        console.error(
+          '[ai auto-reply] disable-on-agent-send failed:',
+          disableErr.message
+        );
+      }
     }
   } catch (err) {
     console.error(

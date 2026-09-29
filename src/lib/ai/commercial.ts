@@ -49,9 +49,8 @@ export function isCommercialConversation(
  * do lead (ver `dispatchInboundToAiReply`).
  */
 export const DEFAULT_COMMERCIAL_WELCOME_MESSAGE =
-  'Olá! Sou o agente de IA da Eter Growth, é exactamente isto que pomos a funcionar nas empresas: ' +
-  'resposta em segundos, a qualquer hora. Conte-me em uma frase o que faz a sua empresa e ' +
-  'mostro-lhe como ficaria no seu caso.'
+  'Olá! Sou a Vera, da Eter Growth. Com quem estou a falar?'
+
 
 /**
  * Fixed fallback sent when the AI call fails, times out, or returns no
@@ -63,6 +62,28 @@ export const DEFAULT_COMMERCIAL_WELCOME_MESSAGE =
  */
 export const DEFAULT_COMMERCIAL_FALLBACK_MESSAGE =
   'Recebemos a sua mensagem, obrigada. Estamos só a confirmar uns detalhes e respondemos já de seguida.'
+
+/** True se a conversa já tem alguma mensagem nossa (sender_type 'agent'
+ *  ou 'bot': templates, envios humanos ou da IA). */
+export async function hasOutboundMessage(
+  db: SupabaseClient,
+  conversationId: string,
+): Promise<boolean> {
+  const { data, error } = await db
+    .from('messages')
+    .select('id')
+    .eq('conversation_id', conversationId)
+    .in('sender_type', ['agent', 'bot'])
+    .limit(1)
+  if (error) {
+    console.error(
+      '[ai auto-reply] commercial welcome: falha a verificar mensagens outbound:',
+      error.message,
+    )
+    return false
+  }
+  return Array.isArray(data) && data.length > 0
+}
 
 interface WelcomeArgs {
   db: SupabaseClient
@@ -102,6 +123,27 @@ interface WelcomeArgs {
 export async function sendCommercialWelcomeIfNeeded(args: WelcomeArgs): Promise<boolean> {
   const { db, accountId, conversationId, contactId, configOwnerUserId, welcomeMessage, source } = args
   try {
+    // Se já saiu alguma mensagem nossa nesta conversa (template de
+    // outreach do AI SDR, mensagem de um humano, etc.), o lead já foi
+    // tratado e a abertura fixa ("Com quem estou a falar?") seria
+    // errada. Marca a abertura como enviada (best-effort) e deixa a IA
+    // responder normalmente. Erro de leitura conta como "sem outbound":
+    // a abertura é a rede de segurança da janela de 24h.
+    if (await hasOutboundMessage(db, conversationId)) {
+      const { error: markErr } = await db
+        .from('conversations')
+        .update({ commercial_welcome_sent_at: new Date().toISOString() })
+        .eq('id', conversationId)
+        .is('commercial_welcome_sent_at', null)
+      if (markErr) {
+        console.error(
+          '[ai auto-reply] commercial welcome: falha a marcar a abertura como já enviada:',
+          markErr.message,
+        )
+      }
+      return false
+    }
+
     const { data: claimedRows, error } = await db
       .from('conversations')
       .update({ commercial_welcome_sent_at: new Date().toISOString() })

@@ -8,7 +8,10 @@ import {
   DEFAULT_COMMERCIAL_WELCOME_MESSAGE,
   DEFAULT_COMMERCIAL_FALLBACK_MESSAGE,
   hasRecentCommercialFallback,
+  hasOutboundMessage,
+  sendCommercialWelcomeIfNeeded,
 } from './commercial'
+import { engineSendText } from '@/lib/flows/meta-send'
 
 // ============================================================
 // Abertura única (Ricardo, 29/09/2026) e limite do fallback. O
@@ -19,7 +22,7 @@ import {
 describe('DEFAULT_COMMERCIAL_WELCOME_MESSAGE', () => {
   it('é exactamente o texto fixo aprovado, sem pergunta de cargo', () => {
     expect(DEFAULT_COMMERCIAL_WELCOME_MESSAGE).toBe(
-      'Olá! Sou o agente de IA da Eter Growth, é exactamente isto que pomos a funcionar nas empresas: resposta em segundos, a qualquer hora. Conte-me em uma frase o que faz a sua empresa e mostro-lhe como ficaria no seu caso.',
+      'Olá! Sou a Vera, da Eter Growth. Com quem estou a falar?',
     )
     expect(DEFAULT_COMMERCIAL_WELCOME_MESSAGE).not.toContain('\u2014')
   })
@@ -67,5 +70,67 @@ describe('hasRecentCommercialFallback', () => {
     await expect(hasRecentCommercialFallback(db, 'conv-1')).resolves.toBe(false)
     expect(errorSpy).toHaveBeenCalled()
     errorSpy.mockRestore()
+  })
+})
+
+describe('hasOutboundMessage', () => {
+  function db(result: { data: unknown; error: { message: string } | null }) {
+    const calls: { method: string; args: unknown[] }[] = []
+    const chain: Record<string, unknown> = {}
+    for (const m of ['select', 'eq', 'in']) {
+      chain[m] = (...args: unknown[]) => {
+        calls.push({ method: m, args })
+        return chain
+      }
+    }
+    chain.limit = () => Promise.resolve(result)
+    return { db: { from: () => chain } as unknown as SupabaseClient, calls }
+  }
+
+  it('true quando existe mensagem agent/bot na conversa', async () => {
+    const { db: d, calls } = db({ data: [{ id: 'm1' }], error: null })
+    await expect(hasOutboundMessage(d, 'conv-1')).resolves.toBe(true)
+    expect(calls).toContainEqual({ method: 'in', args: ['sender_type', ['agent', 'bot']] })
+  })
+  it('false sem mensagens e em erro de leitura', async () => {
+    await expect(hasOutboundMessage(db({ data: [], error: null }).db, 'c')).resolves.toBe(false)
+    await expect(
+      hasOutboundMessage(db({ data: null, error: { message: 'x' } }).db, 'c'),
+    ).resolves.toBe(false)
+  })
+})
+
+describe('sendCommercialWelcomeIfNeeded com outbound anterior (template)', () => {
+  it('não envia a abertura, marca-a como enviada e devolve false', async () => {
+    vi.mocked(engineSendText).mockClear()
+    const updates: unknown[] = []
+    const upd: Record<string, unknown> = {
+      eq: () => upd,
+      is: () => Promise.resolve({ error: null }),
+    }
+    const sel: Record<string, unknown> = {
+      select: () => sel,
+      eq: () => sel,
+      in: () => sel,
+      limit: () => Promise.resolve({ data: [{ id: 'tpl-1' }], error: null }),
+    }
+    const d = {
+      from: (t: string) =>
+        t === 'messages'
+          ? sel
+          : { update: (p: unknown) => (updates.push(p), upd) },
+    } as unknown as SupabaseClient
+    const sent = await sendCommercialWelcomeIfNeeded({
+      db: d,
+      accountId: 'a',
+      conversationId: 'c',
+      contactId: 'ct',
+      configOwnerUserId: 'u',
+      welcomeMessage: null,
+      source: 'direct',
+    })
+    expect(sent).toBe(false)
+    expect(engineSendText).not.toHaveBeenCalled()
+    expect(updates).toHaveLength(1)
   })
 })

@@ -25,6 +25,7 @@ const h = vi.hoisted(() => ({
     // (WHERE commercial_welcome_sent_at IS NULL) wins the race. false
     // simulates "already sent" / "lost the race".
     welcomeClaimed: true as boolean,
+    hasOutbound: false as boolean,
     // Se o fallback fixo já saiu nesta conversa nas últimas 24h
     // (consulta a `messages` em hasRecentCommercialFallback).
     recentFallbackExists: false as boolean,
@@ -83,13 +84,22 @@ vi.mock('./admin-client', () => ({
       }
       if (table === 'messages') {
         // .select().eq().eq().eq().gte().limit() → fallback recente?
+        // .select().eq().in().limit() → já há mensagem outbound?
+        let isOutboundCheck = false
         const chain: Record<string, unknown> = {
           select: () => chain,
           eq: () => chain,
           gte: () => chain,
+          in: () => {
+            // .in('sender_type', ...) → verificação de outbound anterior
+            isOutboundCheck = true
+            return chain
+          },
           limit: () =>
             Promise.resolve({
-              data: h.state.recentFallbackExists ? [{ id: 'msg-fb' }] : [],
+              data: (isOutboundCheck ? h.state.hasOutbound : h.state.recentFallbackExists)
+                ? [{ id: 'msg-fb' }]
+                : [],
               error: null,
             }),
         }
@@ -210,6 +220,7 @@ beforeEach(() => {
   // turno anterior), por isso a IA corre neste turno. Os testes da
   // abertura ligam `welcomeClaimed = true` explicitamente.
   h.state.welcomeClaimed = false
+  h.state.hasOutbound = false
   h.state.recentFallbackExists = false
   h.scheduleAdLeadCadence.mockReset()
   h.scheduleAdLeadCadence.mockResolvedValue(undefined)
@@ -699,6 +710,20 @@ describe('dispatchInboundToAiReply — Bloco 3-A modo comercial por omissão', (
     expect(h.engineSendText).toHaveBeenCalledTimes(1)
     expect(h.generateReplyWithTools).not.toHaveBeenCalled()
     errorSpy.mockRestore()
+  })
+
+  it('já há mensagem outbound (template do AI SDR): sem abertura fixa, a IA responde ao contacto', async () => {
+    h.state.conv = commercialConv({ source: 'direct' })
+    h.state.welcomeClaimed = true // o claim ganharia, mas o outbound anterior trava-o
+    h.state.hasOutbound = true
+    h.loadAiConfig.mockResolvedValue(commercialConfig())
+    await dispatchInboundToAiReply(ARGS)
+
+    expect(h.engineSendText).toHaveBeenCalledTimes(1)
+    expect(h.engineSendText).not.toHaveBeenCalledWith(
+      expect.objectContaining({ text: DEFAULT_COMMERCIAL_WELCOME_MESSAGE }),
+    )
+    expect(h.generateReplyWithTools).toHaveBeenCalledTimes(1)
   })
 
   it('does not resend the welcome once commercial_welcome_sent_at is already set', async () => {
