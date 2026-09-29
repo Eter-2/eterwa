@@ -141,7 +141,7 @@ export const AD_REACTIVATION_TEMPLATE_NAME = 'eter_reativacao_v1'
 export const AD_REACTIVATION_TEMPLATE_LANGUAGE = 'pt_PT'
 
 /** Valor da variável {{1}} quando não há um primeiro nome utilizável. */
-export const TEMPLATE_FIRST_NAME_FALLBACK = 'olá'
+export const TEMPLATE_FIRST_NAME_FALLBACK = 'de novo'
 
 /**
  * Primeiro nome do contacto para a variável {{1}} do template. Nunca

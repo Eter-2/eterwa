@@ -149,8 +149,8 @@ describe('firstNameForTemplate', () => {
     expect(firstNameForTemplate('Ana-Rita Costa')).toBe('Ana-Rita')
   })
   it('nunca devolve vazio: sem nome ou nome inutilizável cai no fallback', () => {
-    for (const v of [null, undefined, '', '   ', '351912345678', '🚀', '+351 912 345 678']) {
-      expect(firstNameForTemplate(v)).toBe('olá')
+    for (const v of [null, undefined, '', '   ', '351912345678', '🚀', '+351 912 345 678', '---', "''", '★ Empresa', '😀😀 Ana']) {
+      expect(firstNameForTemplate(v)).toBe('de novo')
     }
   })
   it('ignora emojis e símbolos colados ao nome', () => {
