@@ -11,6 +11,11 @@ import {
   phoneVariants,
   isRecipientNotAllowedError,
 } from '@/lib/whatsapp/phone-utils'
+import {
+  ensureTemplateRow,
+  templateMessageText,
+} from '@/lib/whatsapp/template-render'
+import type { MessageTemplate } from '@/types'
 import { supabaseAdmin } from './admin-client'
 
 // ------------------------------------------------------------
@@ -142,6 +147,24 @@ async function sendViaMeta(input: SendInput): Promise<{ whatsapp_message_id: str
 
   const accessToken = decrypt(config.access_token)
 
+  // Template: obtém a linha (local ou da Graph API) para enviar com os
+  // componentes certos e para gravar o corpo renderizado na mensagem.
+  let templateRow: MessageTemplate | null = null
+  if (input.kind === 'template') {
+    templateRow = await ensureTemplateRow(db, {
+      accountId: input.accountId,
+      userId: input.userId,
+      wabaId: config.waba_id ?? null,
+      accessToken,
+      name: input.templateName,
+      language: input.language || 'en_US',
+    })
+  }
+  const templateText =
+    input.kind === 'template'
+      ? templateMessageText(templateRow, input.templateName, input.params ?? [])
+      : null
+
   const attempt = async (phone: string): Promise<string> => {
     if (input.kind === 'template') {
       const r = await sendTemplateMessage({
@@ -151,6 +174,7 @@ async function sendViaMeta(input: SendInput): Promise<{ whatsapp_message_id: str
         templateName: input.templateName,
         language: input.language,
         params: input.params,
+        template: templateRow ?? undefined,
       })
       return r.messageId
     }
@@ -192,7 +216,7 @@ async function sendViaMeta(input: SendInput): Promise<{ whatsapp_message_id: str
   // Meta message id. sender_type='bot' distinguishes automation sends
   // from manual agent sends.
   const content_type = input.kind === 'template' ? 'template' : 'text'
-  const content_text = input.kind === 'text' ? input.text : null
+  const content_text = input.kind === 'text' ? input.text : templateText
   const template_name = input.kind === 'template' ? input.templateName : null
 
   const { error: msgErr } = await db.from('messages').insert({
@@ -214,7 +238,7 @@ async function sendViaMeta(input: SendInput): Promise<{ whatsapp_message_id: str
     .from('conversations')
     .update({
       last_message_text:
-        input.kind === 'template' ? `[template:${input.templateName}]` : input.text,
+        templateText ?? (input.kind === 'text' ? input.text : null),
       last_message_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     })
