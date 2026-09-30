@@ -105,7 +105,7 @@ export async function dispatchInboundToAiReply(
     const { data: conv, error: convErr } = await db
       .from('conversations')
       .select(
-        'assigned_agent_id, ai_autoreply_disabled, ai_reply_count, source, commercial_welcome_sent_at, escalation_reason, handoff_blocked_attempts, team_requested_at',
+        'assigned_agent_id, ai_autoreply_disabled, ai_reply_count, source, ad_id, commercial_welcome_sent_at, escalation_reason, handoff_blocked_attempts, team_requested_at',
       )
       .eq('id', conversationId)
       .maybeSingle()
@@ -165,14 +165,20 @@ export async function dispatchInboundToAiReply(
       // sendCommercialWelcomeIfNeeded's doc comment for why. Never
       // throws, so a send failure here still lets the AI reply below
       // attempt to run.
-      await sendCommercialWelcomeIfNeeded({
+      const welcomeSentNow = await sendCommercialWelcomeIfNeeded({
         db,
         accountId,
         conversationId,
         contactId,
         configOwnerUserId,
         welcomeMessage: config.commercialWelcomeMessage,
+        source: conv.source as string | null,
       })
+      // Sem IA no primeiro turno: se a abertura acabou de sair neste
+      // inbound, a IA (e o fallback) ficam para a mensagem seguinte do
+      // lead. A conversa, o contacto e o referral do anúncio já foram
+      // gravados pelo webhook antes de chegar aqui.
+      if (welcomeSentNow) return
     }
 
     const messages = await buildConversationContext(db, conversationId)
@@ -251,6 +257,7 @@ export async function dispatchInboundToAiReply(
           err instanceof Error ? err.message : err,
         )
         await sendCommercialFallback({
+          db,
           accountId,
           conversationId,
           contactId,
@@ -290,6 +297,7 @@ export async function dispatchInboundToAiReply(
         '[ai auto-reply] commercial mode: o modelo não devolveu texto — a enviar fallback.',
       )
       await sendCommercialFallback({
+        db,
         accountId,
         conversationId,
         contactId,

@@ -286,6 +286,13 @@ const AD_REFERRAL = {
 }
 
 describe('POST /api/whatsapp/webhook — Bloco 3-A referral capture', () => {
+  it('qualquer inbound cancela a cadência de follow-up pendente da conversa', async () => {
+    const res = await postWebhook(webhookBody(AD_REFERRAL))
+    expect(res.status).toBe(200)
+    expect(h.cancelFollowUpCadence).toHaveBeenCalledTimes(1)
+    expect(h.cancelFollowUpCadence).toHaveBeenCalledWith(expect.anything(), expect.any(String), expect.any(String))
+  })
+
   it('persists source/ad_id/ctwa_clid/text/first_referral_at for a NEW conversation opened by an ad referral', async () => {
     const res = await postWebhook(webhookBody(AD_REFERRAL))
     expect(res.status).toBe(200)

@@ -4,11 +4,14 @@ import { buildConversationContext } from './context'
 
 /** Minimal fake matching the query chain in buildConversationContext:
  *  from().select().eq().eq().order().limit() → { data, error }. */
+const inCalls: unknown[][] = []
 function fakeDb(rows: unknown[]): SupabaseClient {
+  inCalls.length = 0
   const chain = {
     from: () => chain,
     select: () => chain,
     eq: () => chain,
+    in: (...args: unknown[]) => { inCalls.push(args); return chain },
     order: () => chain,
     limit: () => Promise.resolve({ data: rows, error: null }),
   }
@@ -49,5 +52,20 @@ describe('buildConversationContext', () => {
       'conv-1',
     )
     expect(out).toEqual([{ role: 'user', content: 'real' }])
+  })
+
+  it('inclui templates (content_type template) com o corpo renderizado', async () => {
+    const out = await buildConversationContext(
+      fakeDb([
+        { sender_type: 'customer', content_text: 'Sim, quero retomar' },
+        { sender_type: 'agent', content_text: 'Olá Bruno, sou a Vera, agente de IA da Eter Growth.' },
+      ]),
+      'conv-1',
+    )
+    expect(inCalls[0]).toEqual(['content_type', ['text', 'template']])
+    expect(out[0]).toEqual({
+      role: 'assistant',
+      content: 'Olá Bruno, sou a Vera, agente de IA da Eter Growth.',
+    })
   })
 })

@@ -1,5 +1,6 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { engineSendText } from '@/lib/flows/meta-send'
+import { scheduleAdLeadCadence } from '@/lib/eter/followups'
 import { normalizePhone, phonesMatch } from '@/lib/whatsapp/phone-utils'
 import type { AiConfig } from './types'
 
@@ -39,16 +40,17 @@ export function isCommercialConversation(
 }
 
 /**
- * Default welcome sent immediately on the first inbound message of a
- * commercial conversation, used whenever the account hasn't set its
- * own `commercial_welcome_message`. Portuguese (Portugal) — this is
- * also the "boas-vindas adequada a quem acabou de clicar no anúncio"
- * required by Bloco 3-A.
+ * Abertura fixa, enviada de imediato na primeira mensagem de uma
+ * conversa comercial. É o texto único para conversas vindas de anúncio
+ * (`conversations.source = 'meta_ad'`) e também a boas-vindas por
+ * omissão das conversas directas sem `commercial_welcome_message`
+ * próprio. Sem pergunta de cargo e sem variação por anúncio (decisão do
+ * Ricardo, 29/09/2026). A IA só responde a partir da mensagem seguinte
+ * do lead (ver `dispatchInboundToAiReply`).
  */
 export const DEFAULT_COMMERCIAL_WELCOME_MESSAGE =
-  'Olá! Obrigado por nos contactar. 😊 ' +
-  'Somos a equipa comercial e estamos aqui para perceber melhor o seu negócio e ver como podemos ajudar. ' +
-  'Em que empresa ou projecto está, e que problema gostava de resolver?'
+  'Olá! Sou a Vera, da Eter Growth. Com quem estou a falar?'
+
 
 /**
  * Fixed fallback sent when the AI call fails, times out, or returns no
@@ -61,6 +63,28 @@ export const DEFAULT_COMMERCIAL_WELCOME_MESSAGE =
 export const DEFAULT_COMMERCIAL_FALLBACK_MESSAGE =
   'Recebemos a sua mensagem, obrigada. Estamos só a confirmar uns detalhes e respondemos já de seguida.'
 
+/** True se a conversa já tem alguma mensagem nossa (sender_type 'agent'
+ *  ou 'bot': templates, envios humanos ou da IA). */
+export async function hasOutboundMessage(
+  db: SupabaseClient,
+  conversationId: string,
+): Promise<boolean> {
+  const { data, error } = await db
+    .from('messages')
+    .select('id')
+    .eq('conversation_id', conversationId)
+    .in('sender_type', ['agent', 'bot'])
+    .limit(1)
+  if (error) {
+    console.error(
+      '[ai auto-reply] commercial welcome: falha a verificar mensagens outbound:',
+      error.message,
+    )
+    return false
+  }
+  return Array.isArray(data) && data.length > 0
+}
+
 interface WelcomeArgs {
   db: SupabaseClient
   accountId: string
@@ -68,6 +92,10 @@ interface WelcomeArgs {
   contactId: string
   configOwnerUserId: string
   welcomeMessage: string | null | undefined
+  /** `conversations.source` (migração 045). Quando `'meta_ad'`, a abertura é
+   *  sempre o texto fixo (ignora `welcomeMessage`) e agenda-se a cadência
+   *  de follow-up dos leads de anúncio. */
+  source?: string | null
 }
 
 /**
@@ -88,10 +116,34 @@ interface WelcomeArgs {
  * comment) — so two inbound messages landing close together, or a
  * webhook retry, can never send this twice. Never throws: a failure
  * here must not block the rest of the auto-reply flow.
+ *
+ * Devolve `true` só quando a abertura foi enviada AGORA, neste inbound;
+ * o chamador não deve então correr a IA (nem o fallback) neste turno.
  */
-export async function sendCommercialWelcomeIfNeeded(args: WelcomeArgs): Promise<void> {
-  const { db, accountId, conversationId, contactId, configOwnerUserId, welcomeMessage } = args
+export async function sendCommercialWelcomeIfNeeded(args: WelcomeArgs): Promise<boolean> {
+  const { db, accountId, conversationId, contactId, configOwnerUserId, welcomeMessage, source } = args
   try {
+    // Se já saiu alguma mensagem nossa nesta conversa (template de
+    // outreach do AI SDR, mensagem de um humano, etc.), o lead já foi
+    // tratado e a abertura fixa ("Com quem estou a falar?") seria
+    // errada. Marca a abertura como enviada (best-effort) e deixa a IA
+    // responder normalmente. Erro de leitura conta como "sem outbound":
+    // a abertura é a rede de segurança da janela de 24h.
+    if (await hasOutboundMessage(db, conversationId)) {
+      const { error: markErr } = await db
+        .from('conversations')
+        .update({ commercial_welcome_sent_at: new Date().toISOString() })
+        .eq('id', conversationId)
+        .is('commercial_welcome_sent_at', null)
+      if (markErr) {
+        console.error(
+          '[ai auto-reply] commercial welcome: falha a marcar a abertura como já enviada:',
+          markErr.message,
+        )
+      }
+      return false
+    }
+
     const { data: claimedRows, error } = await db
       .from('conversations')
       .update({ commercial_welcome_sent_at: new Date().toISOString() })
@@ -104,12 +156,16 @@ export async function sendCommercialWelcomeIfNeeded(args: WelcomeArgs): Promise<
         '[ai auto-reply] commercial welcome: falha ao reservar o envio único:',
         error.message,
       )
-      return
+      return false
     }
-    if (!claimedRows || claimedRows.length === 0) return // already sent, or lost the race
+    if (!claimedRows || claimedRows.length === 0) return false // already sent, or lost the race
 
+    // Conversa vinda de anúncio: texto fixo, independentemente de a
+    // conta ter um `commercial_welcome_message` próprio (esse continua a
+    // valer para conversas directas, source !== 'meta_ad').
+    const isAdLead = source === 'meta_ad'
     const text =
-      welcomeMessage && welcomeMessage.trim()
+      !isAdLead && welcomeMessage && welcomeMessage.trim()
         ? welcomeMessage.trim()
         : DEFAULT_COMMERCIAL_WELCOME_MESSAGE
 
@@ -121,30 +177,85 @@ export async function sendCommercialWelcomeIfNeeded(args: WelcomeArgs): Promise<
       text,
       aiGenerated: false,
     })
+
+    if (isAdLead) {
+      // Cadência de follow-up para todos os leads de anúncio. Best-effort:
+      // uma falha aqui nunca desfaz a abertura já enviada.
+      try {
+        await scheduleAdLeadCadence(db, accountId, { conversationId, contactId })
+      } catch (err) {
+        console.error(
+          '[ai auto-reply] commercial welcome: falha ao agendar a cadência do lead de anúncio:',
+          err instanceof Error ? err.message : err,
+        )
+      }
+    }
+    return true
   } catch (err) {
     console.error(
       '[ai auto-reply] commercial welcome send failed:',
       err instanceof Error ? err.message : err,
     )
+    return false
   }
 }
 
 interface FallbackArgs {
+  db: SupabaseClient
   accountId: string
   conversationId: string
   contactId: string
   configOwnerUserId: string
 }
 
+const FALLBACK_COOLDOWN_MS = 24 * 60 * 60 * 1000
+
+/** True se o fallback fixo já saiu nesta conversa nas últimas 24h.
+ *  Lê `messages` (o envio grava-se lá com este mesmo texto), por isso
+ *  não precisa de coluna nova. Erro de leitura conta como "não saiu"
+ *  (regista e deixa passar: o fallback é a rede de segurança). */
+export async function hasRecentCommercialFallback(
+  db: SupabaseClient,
+  conversationId: string,
+  now: Date = new Date(),
+): Promise<boolean> {
+  const since = new Date(now.getTime() - FALLBACK_COOLDOWN_MS).toISOString()
+  const { data, error } = await db
+    .from('messages')
+    .select('id')
+    .eq('conversation_id', conversationId)
+    .eq('sender_type', 'bot')
+    .eq('content_text', DEFAULT_COMMERCIAL_FALLBACK_MESSAGE)
+    .gte('created_at', since)
+    .limit(1)
+  if (error) {
+    console.error(
+      '[ai auto-reply] commercial fallback: falha a verificar o limite de 24h:',
+      error.message,
+    )
+    return false
+  }
+  return Array.isArray(data) && data.length > 0
+}
+
 /**
  * Guaranteed reply for commercial mode when the AI call fails, times
- * out, or returns no usable text (see dispatchInboundToAiReply). Never
- * throws — callers treat this as best-effort, same discipline as the
- * rest of the auto-reply / webhook cascade.
+ * out, or returns no usable text (see dispatchInboundToAiReply). Sai no
+ * máximo uma vez por conversa em cada 24h, para não haver cadeias de
+ * "Recebemos a sua mensagem" seguidas; se já saiu, regista o erro e não
+ * envia nada. Never throws — callers treat this as best-effort, same
+ * discipline as the rest of the auto-reply / webhook cascade.
+ * Devolve `true` se enviou.
  */
-export async function sendCommercialFallback(args: FallbackArgs): Promise<void> {
-  const { accountId, conversationId, contactId, configOwnerUserId } = args
+export async function sendCommercialFallback(args: FallbackArgs): Promise<boolean> {
+  const { db, accountId, conversationId, contactId, configOwnerUserId } = args
   try {
+    if (await hasRecentCommercialFallback(db, conversationId)) {
+      console.error(
+        '[ai auto-reply] commercial fallback: já saiu nas últimas 24h nesta conversa, não envia outro.',
+      )
+      return false
+    }
     await engineSendText({
       accountId,
       userId: configOwnerUserId,
@@ -153,10 +264,12 @@ export async function sendCommercialFallback(args: FallbackArgs): Promise<void> 
       text: DEFAULT_COMMERCIAL_FALLBACK_MESSAGE,
       aiGenerated: false,
     })
+    return true
   } catch (err) {
     console.error(
       '[ai auto-reply] commercial fallback send failed:',
       err instanceof Error ? err.message : err,
     )
+    return false
   }
 }

@@ -240,6 +240,13 @@ Ambas opcionais — têm defaults sensatos em `src/lib/ai/defaults.ts`.
 # `runOpenAiToolLoop`). Default: 6.
 AI_MAX_TOOL_ITERATIONS=6
 
+# Timeout por turno do agente, em ms (`aiRequestTimeoutMs`, defaults.ts).
+# No provider claude-agent-sdk cobre o tool loop inteiro (`query()` corre
+# todas as voltas internamente; ver `consumeQueryWithTimeout`). Default:
+# 30000, mas o Sonnet demora 24-33 s, por isso em producao usa-se 60000.
+# (`.env.local.example` nao pode ser editado por esta via, documentado aqui.)
+AI_REQUEST_TIMEOUT_MS=60000
+
 # Orçamento de wall-clock por chamada individual a uma ferramenta antes
 # de devolver um erro ao modelo (nunca deixa a conversa pendurada).
 # Default: 10000 (10s).
@@ -289,6 +296,20 @@ Duas peças novas, ligadas ao webhook inbound do WhatsApp
    Sem o template aprovado correspondente, a linha fica `failed` com o
    motivo em `agent_scheduled_messages.error` — nunca envia texto livre
    fora da janela, nunca falha em silêncio.
+
+   **Cadência dos leads de anúncio (29/09/2026).** Ao enviar a abertura
+   fixa a uma conversa `source = 'meta_ad'`, `scheduleAdLeadCadence`
+   agenda 2 linhas (reutiliza os kinds `follow_up_1d` / `follow_up_3d`,
+   sem migração; o conteúdo vem do `payload`):
+
+   - T+22h: texto livre "Olá! Ficou alguma dúvida? ..." (dentro da janela).
+   - T+3 dias: template Meta `eter_reativacao_v1`, `pt_PT`, 1 variável de
+     corpo `{{1}}` = primeiro nome do contacto (fallback `olá`), enviado
+     sempre como template (`payload.template`). Precisa de estar
+     APPROVED na conta, senão a linha fica `failed` com erro claro.
+
+   Qualquer inbound cancela ambas (`cancelFollowUpCadence`). Sem
+   backfill de conversas antigas. Não há passo T+7.
 
 ## AI SDR — aprovação de decisões via WhatsApp (042_aisdr_approval_forward_queue.sql)
 
@@ -436,3 +457,131 @@ primeiro argumento explícito. Ver o cabeçalho de cada ficheiro em
 `src/lib/eter/repo/` para o porquê (o executor de tools corre sob o
 service-role client, sem RLS — o filtro por conta em código é a única
 fronteira entre workspaces).
+
+## Lead Ads — formulário nativo da Meta → EterWA (059_meta_leads.sql)
+
+Segunda origem de leads, ao lado do Click to WhatsApp (Bloco 3-A):
+alguém submete o formulário nativo da Meta ("Lead Ads") sem sair do
+Facebook/Instagram; a Meta chama `POST /api/meta/leads/webhook` com
+apenas o `leadgen_id`, `src/lib/meta/leads.ts` busca os campos à Graph
+API, cria/reaproveita contacto + conversa (`conversations.source =
+'meta_lead_ad'`), sincroniza com o Twenty e envia um template
+WhatsApp de abertura (ver `src/lib/meta/lead-templates.ts`).
+
+### Variáveis de ambiente
+
+- `META_LEADS_VERIFY_TOKEN` — token do handshake `GET
+  /api/meta/leads/webhook` (separado do `verify_token` por
+  `whatsapp_config`, porque a subscrição de `leadgen` é feita na
+  Página, não na WABA). Sem esta variável o GET recusa sempre
+  (503) — fica assim até o Ricardo a definir. Gerar com:
+  ```bash
+  node -e "console.log(require('crypto').randomBytes(24).toString('hex'))"
+  ```
+  Acrescentar a `.env.local` / ao ambiente de produção como
+  `META_LEADS_VERIFY_TOKEN=<valor>` — nunca commitado.
+- Reaproveita `META_APP_SECRET` (assinatura HMAC, mesma app Meta) e
+  `whatsapp_config.access_token` (já tem `leads_retrieval` segundo o
+  Bloco 4/5 — mesma conta de sistema usada pela Conversions API).
+
+### Mapear a Página à conta (`whatsapp_config.meta_page_id`)
+
+O webhook de `leadgen` chega por `page_id`, não por
+`phone_number_id`. Antes de qualquer lead poder ser processado, uma
+linha de `whatsapp_config` tem de ter `meta_page_id` preenchido:
+
+```sql
+UPDATE whatsapp_config
+SET meta_page_id = '1260498167142264'  -- Página Eter Growth
+WHERE account_id = '<account_id da Eter>';
+```
+
+### Subscrever o webhook (App Dashboard, ou por API)
+
+1. Confirmar que a app `Eter_Wpp` (1491272395910926) já está
+   subscrita ao campo `leadgen` do objecto `page` — `GET
+   /{page_id}/subscribed_apps` (ver descoberta da tarefa: confirmar
+   se o campo aparece; se não, subscrever com `POST
+   /{page_id}/subscribed_apps?subscribed_fields=leadgen`).
+2. Meta for Developers → Webhooks → Page → Callback URL
+   `https://<deployment>/api/meta/leads/webhook`, Verify Token =
+   `META_LEADS_VERIFY_TOKEN`, campo `leadgen`.
+3. Permissão necessária no token: `leads_retrieval` (o token
+   guardado em `whatsapp_config.access_token` já a tem, segundo as
+   leituras de permissões feitas para o Bloco 4/5 — confirmar em
+   Graph API Explorer → Debug Token se o webhook não receber nada).
+
+### Templates (`src/lib/meta/lead-templates.ts`)
+
+Três variantes (`eter_lead_ads_ceo`, `eter_lead_ads_diretor_comercial`,
+`eter_lead_ads_empresario`) + uma genérica (`eter_lead_ads_generico`,
+usada enquanto `AD_ID_TO_PERSONA` estiver vazio — preencher assim que
+os conjuntos de anúncios por persona existirem). Corpo (categoria
+MARKETING, `pt_PT`, variável `{{1}}` = primeiro nome):
+
+> Olá {{1}}, aqui é o agente de IA da Eter Growth. Deixou o contacto no
+> nosso anúncio sobre responder a clientes no WhatsApp em segundos.
+> Quer que lhe explique como funciona na sua empresa?
+
+Botões de resposta rápida: "Sim, explique" / "Agora não".
+
+Para submeter os quatro à Meta (uma vez, requer permissão
+`whatsapp_business_management` no token):
+
+```ts
+import { submitMessageTemplate } from '@/lib/whatsapp/meta-api'
+import { LEAD_TEMPLATES, buildLeadTemplateSubmitPayload } from '@/lib/meta/lead-templates'
+
+for (const def of Object.values(LEAD_TEMPLATES)) {
+  await submitMessageTemplate({
+    wabaId: '2561963054199648',
+    accessToken: '<whatsapp_config.access_token decifrado>',
+    payload: buildLeadTemplateSubmitPayload(def),
+  })
+}
+```
+
+Se a chamada for bloqueada por permissões, o payload de
+`buildLeadTemplateSubmitPayload` é exactamente o que submeter à mão
+em WhatsApp Manager → Contas → Templates de mensagens → Criar
+template (categoria Marketing, corpo + botões acima).
+
+### Payload do formulário (por criar — decisão do Ricardo)
+
+`POST /{page_id}/leadgen_forms` — fora do âmbito desta tarefa (não
+tocar em campanhas/anúncios/formulários), mas o payload fica pronto:
+
+```json
+{
+  "name": "Eter Growth — Responder no WhatsApp em segundos",
+  "follow_up_action_url": "https://etergrowth.com/obrigado",
+  "questions": [
+    { "type": "FULL_NAME" },
+    { "type": "EMAIL" },
+    { "type": "PHONE" },
+    { "type": "COMPANY_NAME" },
+    {
+      "type": "CUSTOM",
+      "key": "consentimento_whatsapp",
+      "label": "Aceita ser contactado pela Eter Growth via WhatsApp sobre este assunto?"
+    }
+  ],
+  "privacy_policy": {
+    "url": "https://etergrowth.com/privacidade",
+    "link_text": "Política de privacidade"
+  }
+}
+```
+
+`normalizeLeadFields` (`src/lib/meta/leads.ts`) lê tanto os nomes
+padrão da Meta (`first_name`/`last_name`/`email`/`phone_number`/
+`company_name`) como a chave custom `consentimento_whatsapp` acima —
+funciona com este payload sem alterações.
+
+### Campanha (por criar — decisão do Ricardo)
+
+`POST /act_2570186960131561/campaigns` com `objective:
+OUTCOME_LEADS`; o conjunto de anúncios optimizado para leads usa
+`optimization_goal: LEAD_GENERATION`, `destination_type: ON_AD` e o
+`page_id`/`promoted_object.page_id` da Eter Growth. Fora do âmbito
+desta tarefa.

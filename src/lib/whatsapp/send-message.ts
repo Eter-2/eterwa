@@ -44,6 +44,11 @@ import {
 } from '@/lib/whatsapp/phone-utils';
 import type { MessageTemplate } from '@/types';
 import { isMessageTemplate } from '@/lib/whatsapp/template-row-guard';
+import {
+  fetchAndStoreTemplate,
+  templateBodyParams,
+  templateMessageText,
+} from '@/lib/whatsapp/template-render';
 
 export const MEDIA_KINDS = ['image', 'video', 'document', 'audio'] as const;
 export const VALID_MESSAGE_TYPES = [
@@ -327,6 +332,19 @@ export async function sendMessageToConversation(
       );
     }
     templateRow = data ?? null;
+    // Sem linha local (template criado na Meta, sync nunca correu):
+    // vai buscá-lo à Graph API e grava-o, para enviar com os componentes
+    // certos e para conseguir gravar o texto renderizado na mensagem.
+    if (!templateRow) {
+      templateRow = await fetchAndStoreTemplate(db, {
+        accountId,
+        userId: (config as { user_id?: string }).user_id ?? null,
+        wabaId: (config as { waba_id?: string | null }).waba_id ?? null,
+        accessToken,
+        name: templateName,
+        language: templateLanguage || 'en_US',
+      });
+    }
   }
 
   const attempt = async (phone: string): Promise<string> => {
@@ -448,13 +466,26 @@ export async function sendMessageToConversation(
   const interactiveBody =
     messageType === 'interactive' ? interactivePayload!.body : null;
 
+  // Templates: grava o corpo renderizado (o Inbox e a IA leem
+  // content_text). Se o chamador já mandou texto (ex.: composer do
+  // Inbox), respeita-o; senão renderiza a partir do template + params.
+  const templateText =
+    messageType === 'template'
+      ? contentText?.trim() ||
+        templateMessageText(
+          templateRow,
+          templateName!,
+          templateBodyParams(templateMessageParams, templateParams)
+        )
+      : null;
+
   const { data: messageRecord, error: msgError } = await db
     .from('messages')
     .insert({
       conversation_id: conversationId,
       sender_type: 'agent',
       content_type: messageType,
-      content_text: interactiveBody ?? contentText ?? null,
+      content_text: interactiveBody ?? templateText ?? contentText ?? null,
       media_url: mediaUrl || null,
       template_name: templateName || null,
       interactive_payload:
@@ -478,7 +509,7 @@ export async function sendMessageToConversation(
   const lastMessageText =
     messageType === 'interactive'
       ? interactivePayloadPreviewText(interactivePayload!)
-      : contentText || `[${messageType}]`;
+      : templateText || contentText || `[${messageType}]`;
 
   await db
     .from('conversations')
@@ -522,16 +553,36 @@ export async function sendMessageToConversation(
   // não volta a ligar-se sozinho — e best-effort, como o pause-flows
   // acima: uma falha aqui não pode transformar um envio bem-sucedido
   // num erro para o agente humano.
+  //
+  // Excepção: templates (outreach do AI SDR ou da equipa) NÃO calam a
+  // IA. Um template é a abertura fora da janela de 24h; quando o
+  // contacto responde, a Vera tem de continuar a conversa. Em vez
+  // disso, marca-se a abertura fixa como já enviada, para nunca
+  // perguntar "com quem estou a falar?" a quem já tratámos pelo nome.
   try {
-    const { error: disableErr } = await db
-      .from('conversations')
-      .update({ ai_autoreply_disabled: true })
-      .eq('id', conversationId);
-    if (disableErr) {
-      console.error(
-        '[ai auto-reply] disable-on-agent-send failed:',
-        disableErr.message
-      );
+    if (messageType === 'template') {
+      const { error: welcomeErr } = await db
+        .from('conversations')
+        .update({ commercial_welcome_sent_at: new Date().toISOString() })
+        .eq('id', conversationId)
+        .is('commercial_welcome_sent_at', null);
+      if (welcomeErr) {
+        console.error(
+          '[ai auto-reply] mark-welcome-on-template failed:',
+          welcomeErr.message
+        );
+      }
+    } else {
+      const { error: disableErr } = await db
+        .from('conversations')
+        .update({ ai_autoreply_disabled: true })
+        .eq('id', conversationId);
+      if (disableErr) {
+        console.error(
+          '[ai auto-reply] disable-on-agent-send failed:',
+          disableErr.message
+        );
+      }
     }
   } catch (err) {
     console.error(

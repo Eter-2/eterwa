@@ -265,6 +265,150 @@ describe('sendMessageToConversation — happy path desliga o auto-reply (correc�
   });
 });
 
+describe('sendMessageToConversation — templates gravam o texto renderizado', () => {
+  const BODY = 'Olá {{1}}, sou a Vera. Quer retomar a conversa na {{2}}?';
+
+  function makeDb(templateRow: Record<string, unknown> | null) {
+    const inserted: Record<string, unknown>[] = [];
+    const convUpdates: Record<string, unknown>[] = [];
+    const db = {
+      from(table: string) {
+        if (table === 'conversations') {
+          return {
+            select: () => ({
+              eq: () => ({
+                eq: () => ({
+                  single: () =>
+                    Promise.resolve({
+                      data: { id: 'cv-1', contact: { id: 'c-1', phone: '+351911111111' } },
+                      error: null,
+                    }),
+                }),
+              }),
+            }),
+            update: (p: Record<string, unknown>) => {
+              convUpdates.push(p);
+              return { eq: () => ({ is: () => Promise.resolve({ error: null }), then: (r: (v: unknown) => void) => r({ error: null }) }) };
+            },
+          };
+        }
+        if (table === 'whatsapp_config') {
+          return {
+            select: () => ({
+              eq: () => ({
+                single: () =>
+                  Promise.resolve({
+                    data: { id: 'wc-1', phone_number_id: 'pn', access_token: 'enc:t', waba_id: 'w', user_id: 'u-1' },
+                    error: null,
+                  }),
+              }),
+            }),
+          };
+        }
+        if (table === 'message_templates') {
+          return {
+            select: () => {
+              const q: Record<string, unknown> = {};
+              q.eq = () => q;
+              q.maybeSingle = () => Promise.resolve({ data: templateRow, error: null });
+              return q;
+            },
+            insert: (row: Record<string, unknown>) => ({
+              select: () => ({
+                single: () =>
+                  Promise.resolve({ data: { ...row, id: 'tpl-new', created_at: 'x' }, error: null }),
+              }),
+            }),
+          };
+        }
+        if (table === 'messages') {
+          return {
+            insert: (row: Record<string, unknown>) => {
+              inserted.push(row);
+              return { select: () => ({ single: () => Promise.resolve({ data: { id: 'msg-1' }, error: null }) }) };
+            },
+          };
+        }
+        throw new Error(`unexpected table: ${table}`);
+      },
+    } as unknown as SupabaseClient;
+    return { db, inserted, convUpdates };
+  }
+
+  beforeEach(async () => {
+    const meta = await import('@/lib/whatsapp/meta-api');
+    vi.mocked(meta.sendTemplateMessage).mockResolvedValue({ messageId: 'wamid.tpl' });
+  });
+
+  it('renderiza o corpo do template local com os params e actualiza a pré-visualização', async () => {
+    const { db, inserted, convUpdates } = makeDb({
+      id: 'tpl-1', user_id: 'u-1', name: 'v2', language: 'pt_PT', body_text: BODY,
+    });
+    await sendMessageToConversation(db, 'acct-1', {
+      conversationId: 'cv-1',
+      messageType: 'template',
+      templateName: 'v2',
+      templateLanguage: 'pt_PT',
+      templateMessageParams: { body: ['Bruno', 'Magnusberry'] },
+    });
+    const expected = 'Olá Bruno, sou a Vera. Quer retomar a conversa na Magnusberry?';
+    expect(inserted[0].content_text).toBe(expected);
+    expect(convUpdates).toContainEqual(expect.objectContaining({ last_message_text: expected }));
+  });
+
+  it('sem linha local vai buscar o corpo à Graph API', async () => {
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(() =>
+      Promise.resolve(new Response(JSON.stringify({ data: [{
+        id: '1', name: 'v2', language: 'pt_PT', status: 'APPROVED', category: 'MARKETING',
+        components: [{ type: 'BODY', text: BODY }],
+      }] }), { status: 200 })),
+    ) as unknown as typeof fetch;
+    try {
+      const { db, inserted } = makeDb(null);
+      await sendMessageToConversation(db, 'acct-1', {
+        conversationId: 'cv-1',
+        messageType: 'template',
+        templateName: 'v2',
+        templateLanguage: 'pt_PT',
+        templateParams: ['Ana', 'Acme'],
+      });
+      expect(inserted[0].content_text).toBe('Olá Ana, sou a Vera. Quer retomar a conversa na Acme?');
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  it('se tudo falhar grava o fallback [template: nome]', async () => {
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(() => Promise.resolve(new Response('{}', { status: 500 }))) as unknown as typeof fetch;
+    try {
+      const { db, inserted } = makeDb(null);
+      await sendMessageToConversation(db, 'acct-1', {
+        conversationId: 'cv-1',
+        messageType: 'template',
+        templateName: 'v2',
+        templateLanguage: 'pt_PT',
+      });
+      expect(inserted[0].content_text).toBe('[template: v2]');
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  it('respeita o content_text enviado pelo Inbox', async () => {
+    const { db, inserted } = makeDb({ id: 't', user_id: 'u', name: 'v2', language: 'pt_PT', body_text: BODY });
+    await sendMessageToConversation(db, 'acct-1', {
+      conversationId: 'cv-1',
+      messageType: 'template',
+      templateName: 'v2',
+      templateLanguage: 'pt_PT',
+      contentText: 'texto já renderizado',
+    });
+    expect(inserted[0].content_text).toBe('texto já renderizado');
+  });
+});
+
 describe('SendMessageError', () => {
   it('carries a machine code and an HTTP status', () => {
     const e = new SendMessageError('meta_error', 'boom', 502);

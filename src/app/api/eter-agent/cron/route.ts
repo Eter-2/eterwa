@@ -13,6 +13,7 @@ import {
 import { findApprovedTemplateByName } from '@/lib/eter/repo/message-templates.repo'
 import { isWithinSessionWindow } from '@/lib/eter/session-window'
 import { engineSendText, engineSendTemplate } from '@/lib/automations/meta-send'
+import { firstNameForTemplate, type ScheduledTemplatePayload } from '@/lib/eter/followups'
 
 /**
  * Drain due `agent_scheduled_messages` rows — the quiet-lead follow-up
@@ -128,7 +129,13 @@ async function sendOne(
   const userId = (wcfg as { user_id: string } | null)?.user_id
   if (!userId) throw new Error('whatsapp_config not found for account')
 
-  const withinWindow = await isWithinSessionWindow(admin, row.conversationId)
+  // Passo de template explícito no payload (cadência dos leads de
+  // anúncio, ver followups.ts `scheduleAdLeadCadence`): envia sempre o
+  // template, dentro ou fora da janela, e nunca texto livre.
+  const payloadTemplate = readTemplatePayload(row.payload)
+  const withinWindow = payloadTemplate
+    ? false
+    : await isWithinSessionWindow(admin, row.conversationId)
 
   if (withinWindow) {
     const text = row.payload.freeText
@@ -145,19 +152,41 @@ async function sendOne(
 
   // Outside the 24h window — an approved template is required. Never
   // fall back to free text here, even if one is present in payload.
-  const templateName = TEMPLATE_NAME_BY_KIND[row.kind]
+  const templateName = payloadTemplate?.name ?? TEMPLATE_NAME_BY_KIND[row.kind]
   const template = await findApprovedTemplateByName(admin, row.accountId, templateName)
   if (!template) {
     throw new Error(
       `outside the 24h session window and no APPROVED template "${templateName}" configured for this account`,
     )
   }
+
+  let params: string[] | undefined
+  if (payloadTemplate?.firstNameParam) {
+    const { data: contact, error: contactErr } = await admin
+      .from('contacts')
+      .select('name')
+      .eq('id', row.contactId)
+      .eq('account_id', row.accountId)
+      .maybeSingle()
+    if (contactErr) throw contactErr
+    params = [firstNameForTemplate((contact as { name: string | null } | null)?.name)]
+  }
+
   await engineSendTemplate({
     accountId: row.accountId,
     userId,
     conversationId: row.conversationId,
     contactId: row.contactId,
     templateName: template.name,
-    language: template.language,
+    language: payloadTemplate?.language ?? template.language,
+    params,
   })
+}
+
+function readTemplatePayload(payload: ScheduledMessage['payload']): ScheduledTemplatePayload | null {
+  const t = payload.template
+  if (!t || typeof t !== 'object') return null
+  const { name, language, firstNameParam } = t as Partial<ScheduledTemplatePayload>
+  if (typeof name !== 'string' || typeof language !== 'string') return null
+  return { name, language, firstNameParam: firstNameParam === true }
 }

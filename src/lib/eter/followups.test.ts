@@ -24,7 +24,14 @@ vi.mock('./repo/messages.repo', () => ({
   getLastInboundMessageText: h.getLastInboundMessageText,
 }))
 
-import { scheduleFollowUpCadence, cancelFollowUpCadence, scheduleMeetingReminders } from './followups'
+import {
+  scheduleFollowUpCadence,
+  scheduleAdLeadCadence,
+  cancelFollowUpCadence,
+  scheduleMeetingReminders,
+  firstNameForTemplate,
+  AD_NUDGE_TEXT,
+} from './followups'
 import { FOLLOW_UP_KINDS } from './repo/scheduled-messages.repo'
 
 const db = {} as SupabaseClient
@@ -81,6 +88,73 @@ describe('scheduleFollowUpCadence', () => {
     expect(new Set(inputs.map((i: { kind: string }) => i.kind))).toEqual(
       new Set(['follow_up_1d', 'follow_up_3d', 'follow_up_7d']),
     )
+  })
+})
+
+describe('follow-ups da cadência morno (tratamento por "você")', () => {
+  it('nenhum texto usa "tu"/"tua"/"quiseres" nem travessão', async () => {
+    h.getLastInboundMessageText.mockResolvedValue('preciso de ajuda')
+    h.cancelScheduledMessagesForConversation.mockResolvedValue(0)
+    h.scheduleMessages.mockResolvedValue([])
+    await scheduleFollowUpCadence(db, 'acct-1', { conversationId: 'conv-1', contactId: null }, new Date())
+    const [, , inputs] = h.scheduleMessages.mock.calls[0]
+    for (const i of inputs as { payload: { freeText: string } }[]) {
+      expect(i.payload.freeText).not.toMatch(/\b(tu|tua|teu|quiseres|te quero|digo-te)\b/i)
+      expect(i.payload.freeText).not.toContain('\u2014')
+    }
+  })
+})
+
+describe('scheduleAdLeadCadence', () => {
+  it('cancel-then-insert: passo 1 a T+22h (texto livre) e passo 2 a T+3d (template eter_reativacao_v1), sem T+7', async () => {
+    h.cancelScheduledMessagesForConversation.mockResolvedValue(0)
+    h.scheduleMessages.mockResolvedValue([])
+    const now = new Date('2026-09-29T09:00:00Z')
+
+    await scheduleAdLeadCadence(db, 'acct-1', { conversationId: 'conv-1', contactId: 'contact-1' }, now)
+
+    expect(h.cancelScheduledMessagesForConversation).toHaveBeenCalledWith(db, 'acct-1', 'conv-1', {
+      kinds: FOLLOW_UP_KINDS,
+    })
+    const [, accountId, inputs] = h.scheduleMessages.mock.calls[0]
+    expect(accountId).toBe('acct-1')
+    expect(inputs).toHaveLength(2)
+    expect(inputs.map((i: { kind: string }) => i.kind)).toEqual(['follow_up_1d', 'follow_up_3d'])
+    expect(inputs[0].sendAt.toISOString()).toBe('2026-09-30T07:00:00.000Z')
+    expect(inputs[0].payload).toEqual({ freeText: AD_NUDGE_TEXT })
+    expect(inputs[0].conversationId).toBe('conv-1')
+    expect(inputs[0].contactId).toBe('contact-1')
+    expect(inputs[1].sendAt.toISOString()).toBe('2026-10-02T09:00:00.000Z')
+    expect(inputs[1].payload).toEqual({
+      template: { name: 'eter_reativacao_v1', language: 'pt_PT', firstNameParam: true },
+    })
+    // Ambos os kinds são cancelados por qualquer inbound
+    // (cancelFollowUpCadence usa FOLLOW_UP_KINDS).
+    for (const i of inputs as { kind: never }[]) expect(FOLLOW_UP_KINDS).toContain(i.kind)
+    // Nunca texto livre no passo fora da janela.
+    expect(inputs[1].payload.freeText).toBeUndefined()
+  })
+
+  it('o passo 1 usa exactamente o texto aprovado', () => {
+    expect(AD_NUDGE_TEXT).toBe(
+      'Olá! Ficou alguma dúvida? Conte-me em uma frase o que faz a sua empresa e mostro-lhe como o agente ficaria no seu caso.',
+    )
+  })
+})
+
+describe('firstNameForTemplate', () => {
+  it('devolve o primeiro nome', () => {
+    expect(firstNameForTemplate('Maria Silva')).toBe('Maria')
+    expect(firstNameForTemplate('  João  ')).toBe('João')
+    expect(firstNameForTemplate('Ana-Rita Costa')).toBe('Ana-Rita')
+  })
+  it('nunca devolve vazio: sem nome ou nome inutilizável cai no fallback', () => {
+    for (const v of [null, undefined, '', '   ', '351912345678', '🚀', '+351 912 345 678', '---', "''", '★ Empresa', '😀😀 Ana']) {
+      expect(firstNameForTemplate(v)).toBe('de novo')
+    }
+  })
+  it('ignora emojis e símbolos colados ao nome', () => {
+    expect(firstNameForTemplate('Carlos🚀 Empresa')).toBe('Carlos')
   })
 })
 
