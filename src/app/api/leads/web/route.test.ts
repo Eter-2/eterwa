@@ -163,17 +163,17 @@ describe('POST /api/leads/web — comportamento', () => {
     expect(JSON.stringify(await res.json())).not.toContain('segredo')
   })
 
-  it('429 depois de 10 pedidos do mesmo IP no minuto', async () => {
+  it('429 depois de 30 pedidos do mesmo IP no minuto', async () => {
     const headers = { 'x-lead-key': KEY, 'x-forwarded-for': '203.0.113.9' }
     let last = 200
-    for (let i = 0; i < 11; i++) last = (await POST(req(BODY, headers))).status
+    for (let i = 0; i < 31; i++) last = (await POST(req(BODY, headers))).status
     expect(last).toBe(429)
     // Outro IP continua a passar.
     expect((await POST(req(BODY, { ...headers, 'x-forwarded-for': '203.0.113.10' }))).status).toBe(200)
   })
 
   it('pedidos sem chave não gastam o orçamento de rate limit', async () => {
-    for (let i = 0; i < 30; i++) await POST(req(BODY, { 'x-forwarded-for': '203.0.113.9' }))
+    for (let i = 0; i < 60; i++) await POST(req(BODY, { 'x-forwarded-for': '203.0.113.9' }))
     const ok = await POST(req(BODY, { 'x-lead-key': KEY, 'x-forwarded-for': '203.0.113.9' }))
     expect(ok.status).toBe(200)
   })

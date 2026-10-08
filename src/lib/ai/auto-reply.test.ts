@@ -1144,3 +1144,70 @@ describe('dispatchInboundToAiReply — Bloco 3-A trava do handoff (nome, email, 
     expect(h.state.updatePayload).not.toHaveProperty('handoff_incomplete')
   })
 })
+
+describe('dispatchInboundToAiReply — modo demo (source site_demo)', () => {
+  it('usa o prompt de demo, as ferramentas da demo e não envia a abertura fixa', async () => {
+    h.state.conv = commercialConv({ source: 'site_demo' })
+    // Mesmo com a reserva da abertura a "ganhar", a demo não a envia.
+    h.state.welcomeClaimed = true
+    h.loadAiConfig.mockResolvedValue(commercialConfig({ commercialCalendarId: 'cal-1' }))
+
+    await dispatchInboundToAiReply(ARGS)
+
+    expect(h.engineSendText).toHaveBeenCalledTimes(1)
+    expect(h.engineSendText).not.toHaveBeenCalledWith(
+      expect.objectContaining({ text: DEFAULT_COMMERCIAL_WELCOME_MESSAGE }),
+    )
+    expect(h.generateReplyWithTools).toHaveBeenCalledTimes(1)
+    const call = h.generateReplyWithTools.mock.calls[0][0] as { systemPrompt: string }
+    expect(call.systemPrompt).toContain('demonstração AO VIVO')
+    expect(call.systemPrompt).toContain('Empresa: Acme Growth Lda')
+    expect(call.systemPrompt).toContain('por "tu"')
+    // O prompt comercial da conta não entra na demo.
+    expect(call.systemPrompt).not.toContain('Somos a Acme Growth.')
+  })
+
+  it('uma conversa direct continua a usar o prompt comercial normal', async () => {
+    h.state.conv = commercialConv({ source: 'direct' })
+    h.loadAiConfig.mockResolvedValue(commercialConfig())
+
+    await dispatchInboundToAiReply(ARGS)
+
+    const call = h.generateReplyWithTools.mock.calls[0][0] as { systemPrompt: string }
+    expect(call.systemPrompt).toContain('Somos a Acme Growth.')
+    expect(call.systemPrompt).not.toContain('demonstração AO VIVO')
+  })
+
+  it('um número da equipa não entra na demo, mesmo com source site_demo', async () => {
+    h.state.conv = commercialConv({ source: 'site_demo' })
+    h.state.contactPhone = '351912345678'
+    h.loadAiConfig.mockResolvedValue(commercialConfig({ teamPhoneNumbers: ['351912345678'] }))
+
+    await dispatchInboundToAiReply(ARGS)
+
+    expect(h.generateReplyWithTools).not.toHaveBeenCalled()
+    const call = h.generateReply.mock.calls[0][0] as { systemPrompt: string }
+    expect(call.systemPrompt).not.toContain('demonstração AO VIVO')
+  })
+
+  it('o tecto de respostas da demo é mais alto que o da conta', async () => {
+    h.state.conv = commercialConv({ source: 'site_demo', ai_reply_count: 10 })
+    h.loadAiConfig.mockResolvedValue(commercialConfig({ autoReplyMaxPerConversation: 3 }))
+
+    await dispatchInboundToAiReply(ARGS)
+
+    expect(h.engineSendText).toHaveBeenCalledTimes(1)
+    expect(h.state.rpcCalls.find((c) => c.name === 'claim_ai_reply_slot')?.args).toMatchObject({
+      max_replies: 40,
+    })
+  })
+
+  it('fora da demo o tecto da conta continua a valer', async () => {
+    h.state.conv = commercialConv({ source: 'direct', ai_reply_count: 10 })
+    h.loadAiConfig.mockResolvedValue(commercialConfig({ autoReplyMaxPerConversation: 3 }))
+
+    await dispatchInboundToAiReply(ARGS)
+
+    expect(h.engineSendText).not.toHaveBeenCalled()
+  })
+})

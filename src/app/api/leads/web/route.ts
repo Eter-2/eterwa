@@ -20,7 +20,7 @@ export const maxDuration = 60
 const MAX_BODY_BYTES = 8 * 1024
 
 /** Por IP (o site passa o IP real em X-Forwarded-For) e global. */
-const RATE_LIMIT_PER_IP = { limit: 10, windowMs: 60_000 }
+const RATE_LIMIT_PER_IP = { limit: 30, windowMs: 60_000 }
 const RATE_LIMIT_GLOBAL = { limit: 120, windowMs: 60_000 }
 
 function keyMatches(supplied: string, expected: string): boolean {
