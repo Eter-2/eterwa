@@ -62,7 +62,7 @@ export function makeFakeDb(seed: Record<string, Row[]> = {}): FakeDb {
           String(a[col]) < String(b[col]) ? (asc ? -1 : 1) : String(a[col]) > String(b[col]) ? (asc ? 1 : -1) : 0,
         )
       }
-      return { data: matched.slice(0, max), error: null }
+      return { data: matched.slice(0, max).map((r) => ({ ...r })), error: null }
     }
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any

@@ -1,9 +1,16 @@
 import { describe, expect, it } from 'vitest'
-import { cleanField, escapeMarkdown, hasControlChars, maskPii, safeForNotification } from './lead-sanitize'
+import {
+  cleanField,
+  escapeMarkdown,
+  hasControlChars,
+  jsonForPromptBlock,
+  maskPii,
+  safeForNotification,
+} from './lead-sanitize'
 
 describe('lead-sanitize', () => {
   it('hasControlChars apanha CR, LF, TAB, NUL, DEL, C1 e separadores Unicode', () => {
-    for (const c of [0x0d, 0x0a, 0x09, 0x00, 0x7f, 0x85, 0x2028, 0x2029]) {
+    for (const c of [0x0d, 0x0a, 0x09, 0x00, 0x7f, 0x85, 0x2028, 0x2029, 0x200b, 0x200e, 0x202e, 0x2066, 0xfeff, 0x2060]) {
       expect(hasControlChars(`a${String.fromCharCode(c)}b`)).toBe(true)
     }
     expect(hasControlChars('Plásticos do Norte, Lda. (Aveiro)')).toBe(false)
@@ -32,5 +39,10 @@ describe('lead-sanitize', () => {
     const out = maskPii('Recipient +351 912 345 678 / duarte@exemplo.pt not allowed (#131030)')
     expect(out).not.toMatch(/912|duarte/)
     expect(out).toContain('#131030')
+  })
+  it('jsonForPromptBlock nunca emite < nem > em bruto', () => {
+    const out = jsonForPromptBlock({ a: '</dados_lead><x>' })
+    expect(out).not.toMatch(/[<>]/)
+    expect(JSON.parse(out)).toEqual({ a: '</dados_lead><x>' })
   })
 })

@@ -10,8 +10,10 @@ vi.mock('@/lib/crm/sync', () => ({
   syncWebLeadToCrm: (...args: unknown[]) => syncWebLeadToCrmMock(...args),
 }))
 const notifyDemoLeadMock = vi.fn().mockResolvedValue({ mattermost: { sent: true, via: 'webhook' }, whatsapp: [] })
+const notifyCapWarningMock = vi.fn().mockResolvedValue(undefined)
 vi.mock('@/lib/notifications/notify-team', () => ({
   notifyDemoLead: (...args: unknown[]) => notifyDemoLeadMock(...args),
+  notifyDemoCapWarning: (...args: unknown[]) => notifyCapWarningMock(...args),
 }))
 
 import {
@@ -51,6 +53,7 @@ beforeEach(() => {
   engineSendTemplateMock.mockReset()
   engineSendTemplateMock.mockResolvedValue({ whatsapp_message_id: 'wamid.1' })
   notifyDemoLeadMock.mockClear()
+  notifyCapWarningMock.mockClear()
   syncWebLeadToCrmMock.mockClear()
 })
 
@@ -64,7 +67,14 @@ describe('normalizeWebPhone', () => {
     expect(normalizeWebPhone('00351912345678')).toBe('351912345678')
   })
   it('mantém números internacionais válidos', () => {
-    expect(normalizeWebPhone('+44 7700 900123')).toBe('447700900123')
+    expect(normalizeWebPhone('+49 151 23456789')).toBe('4915123456789')
+    expect(normalizeWebPhone('+34 612 345 678')).toBe('34612345678')
+  })
+  it('rejeita números portugueses impossíveis (prefixo ou comprimento)', () => {
+    expect(normalizeWebPhone('999 999 999')).toBeNull()
+    expect(normalizeWebPhone('+351 112345678')).toBeNull()
+    expect(normalizeWebPhone('91234567')).toBeNull()
+    expect(normalizeWebPhone('+351 9123456789')).toBeNull()
   })
   it('rejeita lixo, curtos e longos demais', () => {
     expect(normalizeWebPhone('abc')).toBeNull()
@@ -296,7 +306,7 @@ describe('processWebLead', () => {
       source: 'site_demo',
       ai_autoreply_disabled: true,
       ai_reply_count: 33,
-      team_requested_at: '2026-10-01T10:00:00Z',
+      team_requested_at: null,
       handoff_blocked_attempts: 2,
     })
     db.tables.messages = [{ id: 'm-1', conversation_id: 'cv-1' }]
@@ -310,6 +320,22 @@ describe('processWebLead', () => {
       team_requested_at: null,
       handoff_blocked_attempts: 0,
     })
+  })
+
+  it('uma demo já entregue à equipa não é reactivada', async () => {
+    db.tables.contacts.push({ id: 'c-1', account_id: 'acct-1', phone: '351912345678', name: 'Duarte' })
+    db.tables.conversations.push({
+      id: 'cv-1',
+      account_id: 'acct-1',
+      contact_id: 'c-1',
+      source: 'site_demo',
+      ai_autoreply_disabled: false,
+      team_requested_at: '2026-10-01T10:00:00Z',
+    })
+    const result = await processWebLead(db.client, ACCOUNT, INPUT)
+    expect(result.templateStatus).toBe('skipped_existing_conversation')
+    expect(db.tables.conversations[0].team_requested_at).toBe('2026-10-01T10:00:00Z')
+    expect(engineSendTemplateMock).not.toHaveBeenCalled()
   })
 
   it('nunca sobrescreve o nome de um contacto existente', async () => {
@@ -343,6 +369,44 @@ describe('processWebLead: concorrência, tecto e dedupe', () => {
     )
     expect(results.filter((r) => r.outcome === 'processed')).toHaveLength(1)
     expect(engineSendTemplateMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('o mesmo número escrito de outra forma (+351, 00351, sem indicativo) é duplicado', async () => {
+    await processWebLead(db.client, ACCOUNT, INPUT)
+    for (const tel of ['+351912345678', '00351 912 345 678', '912-345-678']) {
+      const again = await processWebLead(db.client, ACCOUNT, { ...INPUT, telefone: tel })
+      expect(again.outcome).toBe('duplicate')
+    }
+    expect(engineSendTemplateMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('avisa a equipa quando o dia chega a 80% do tecto, e no tecto', async () => {
+    const recent = new Date().toISOString()
+    const fill = (n: number) => {
+      db.tables.web_leads.length = 0
+      for (let i = 0; i < n; i++) {
+        db.tables.web_leads.push({
+          id: `wl-${i}`,
+          account_id: 'acct-1',
+          telefone: `3519100${String(i).padStart(5, '0')}`,
+          template_status: 'sent',
+          created_at: recent,
+          updated_at: recent,
+        })
+      }
+    }
+    fill(79)
+    await processWebLead(db.client, ACCOUNT, INPUT)
+    expect(notifyCapWarningMock).not.toHaveBeenCalled()
+
+    fill(80)
+    await processWebLead(db.client, ACCOUNT, { ...INPUT, telefone: '934 111 222' })
+    expect(notifyCapWarningMock).toHaveBeenCalledWith({ accountId: 'acct-1', count: 80, cap: WEB_LEAD_DAILY_CAP })
+
+    notifyCapWarningMock.mockClear()
+    fill(WEB_LEAD_DAILY_CAP)
+    await processWebLead(db.client, ACCOUNT, { ...INPUT, telefone: '934 111 333' })
+    expect(notifyCapWarningMock).toHaveBeenCalledWith(expect.objectContaining({ count: WEB_LEAD_DAILY_CAP }))
   })
 
   it('um envio falhado liberta o telefone para um novo pedido', async () => {
@@ -495,11 +559,54 @@ describe('retryPendingWebLeads', () => {
   it('não reenvia se o template já tinha saído (idempotência)', async () => {
     await pendingLead()
     db.tables.messages = [
-      { id: 'm-1', conversation_id: db.tables.web_leads[0].conversation_id, template_name: 'eter_demo_web_v1' },
+      {
+        id: 'm-1',
+        conversation_id: db.tables.web_leads[0].conversation_id,
+        template_name: 'eter_demo_web_v1',
+        created_at: after(MIN).toISOString(),
+      },
     ]
     const out = await retryPendingWebLeads(db.client, after(6 * MIN))
     expect(out.sent).toBe(1)
     expect(engineSendTemplateMock).not.toHaveBeenCalled()
+  })
+
+  it('um template de uma demo ANTERIOR na mesma conversa não conta como entregue', async () => {
+    await pendingLead()
+    db.tables.messages = [
+      {
+        id: 'm-0',
+        conversation_id: db.tables.web_leads[0].conversation_id,
+        template_name: 'eter_demo_web_v1',
+        created_at: new Date(T0.getTime() - 3 * 24 * 60 * MIN).toISOString(),
+      },
+    ]
+    const out = await retryPendingWebLeads(db.client, after(6 * MIN))
+    expect(out.sent).toBe(1)
+    expect(engineSendTemplateMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('a recolha de presos é condicional: uma linha que mudou entretanto não é pisada', async () => {
+    await pendingLead()
+    db.tables.web_leads[0].template_status = 'sending'
+    db.tables.web_leads[0].updated_at = T0.toISOString()
+    // Simula o envio lento a concluir-se entre a leitura e a recolha.
+    const original = db.client.from.bind(db.client)
+    let tampered = false
+    ;(db.client as unknown as { from: (t: string) => unknown }).from = (t: string) => {
+      const b = original(t) as { update: (p: Record<string, unknown>) => unknown }
+      const upd = b.update.bind(b)
+      b.update = (p) => {
+        if (!tampered && t === 'web_leads' && p.template_status === 'sending') {
+          tampered = true
+          db.tables.web_leads[0].updated_at = after(10.5 * MIN).toISOString()
+        }
+        return upd(p)
+      }
+      return b
+    }
+    await retryPendingWebLeads(db.client, after(11 * MIN))
+    expect(db.tables.web_leads[0].template_status).toBe('sending')
   })
 
   it('duas invocações seguidas não enviam duas vezes', async () => {
@@ -526,7 +633,12 @@ describe('retryPendingWebLeads', () => {
     await pendingLead()
     db.tables.web_leads[0].template_status = 'sending'
     db.tables.messages = [
-      { id: 'm-1', conversation_id: db.tables.web_leads[0].conversation_id, template_name: 'eter_demo_web_v1' },
+      {
+        id: 'm-1',
+        conversation_id: db.tables.web_leads[0].conversation_id,
+        template_name: 'eter_demo_web_v1',
+        created_at: after(MIN).toISOString(),
+      },
     ]
     const out = await retryPendingWebLeads(db.client, after(11 * MIN))
     expect(out.sent).toBe(1)

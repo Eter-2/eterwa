@@ -251,3 +251,46 @@ describe('notifyDemoLead: campos do visitante não confiáveis', () => {
     expect(sent.length).toBeLessThan(300)
   })
 })
+
+describe('notifyHandoff / notifyMeetingBooked: escape dos campos do visitante', () => {
+  it('handoff: nome, empresa, motivo e mensagens não injectam menções nem markdown', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200 })
+    global.fetch = fetchMock as unknown as typeof fetch
+    const { notifyHandoff } = await import('./notify-team')
+    await notifyHandoff({
+      ...HANDOFF_INPUT,
+      contactName: '@all [x](http://mal.pt)\nNome',
+      company: '@channel `c`',
+      reason: '@here **urgente**',
+      lastMessages: [{ role: 'user', content: '@all clica [aqui](http://mal.pt)' }],
+    })
+    const text = JSON.parse(fetchMock.mock.calls[0][1].body as string).text as string
+    for (const bad of ['@all', '@channel', '@here', '[x](', '[aqui](', '**urgente**']) {
+      expect(text).not.toContain(bad)
+    }
+    const wa = h.sendTextMessage.mock.calls[0][0].text as string
+    expect(wa).not.toContain('\n')
+  })
+
+  it('reunião: nome e empresa escapados', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200 })
+    global.fetch = fetchMock as unknown as typeof fetch
+    const { notifyMeetingBooked } = await import('./notify-team')
+    await notifyMeetingBooked({ ...MEETING_INPUT, contactName: '@all Ana', company: '[a](http://mal.pt)' })
+    const text = JSON.parse(fetchMock.mock.calls[0][1].body as string).text as string
+    expect(text).not.toContain('@all')
+    expect(text).not.toContain('[a](')
+  })
+})
+
+describe('notifyDemoCapWarning', () => {
+  it('avisa por Mattermost e WhatsApp, sem lançar', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200 })
+    global.fetch = fetchMock as unknown as typeof fetch
+    const { notifyDemoCapWarning } = await import('./notify-team')
+    await expect(notifyDemoCapWarning({ accountId: 'acct-1', count: 80, cap: 100 })).resolves.toBeUndefined()
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(h.sendTextMessage).toHaveBeenCalledTimes(1)
+    expect(h.sendTextMessage.mock.calls[0][0].text).toContain('80/100')
+  })
+})

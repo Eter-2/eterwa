@@ -7,9 +7,18 @@
 
 /** Caracteres de controlo (inclui CR, LF, TAB), DEL, C1 e os separadores
  *  de linha/parágrafo Unicode (U+2028 e U+2029). */
-const LINE_SEPARATORS = String.fromCharCode(0x2028, 0x2029)
+const INVISIBLE = [
+  [0x2028, 0x2029], // separadores de linha/parágrafo
+  [0x200b, 0x200f], // zero-width e marcas direccionais
+  [0x202a, 0x202e], // embeddings/overrides bidi
+  [0x2060, 0x2064], // word joiner e invisíveis
+  [0x2066, 0x2069], // isolates bidi
+  [0xfeff, 0xfeff], // BOM / zero-width no-break space
+]
+  .map(([a, b]) => `${String.fromCharCode(a)}-${String.fromCharCode(b)}`)
+  .join('')
 // eslint-disable-next-line no-control-regex
-const CONTROL_CHARS = new RegExp(`[\\u0000-\\u001F\\u007F-\\u009F${LINE_SEPARATORS}]`)
+const CONTROL_CHARS = new RegExp(`[\\u0000-\\u001F\\u007F-\\u009F${INVISIBLE}]`)
 // eslint-disable-next-line no-control-regex
 const CONTROL_CHARS_GLOBAL = new RegExp(CONTROL_CHARS.source, 'g')
 
@@ -37,6 +46,13 @@ export function escapeMarkdown(value: string): string {
 /** Campo de lead pronto para uma notificação: limpo, truncado, escapado. */
 export function safeForNotification(value: string | null | undefined, max = 80): string {
   return escapeMarkdown(cleanField(value, max))
+}
+
+/** JSON seguro para pôr dentro de um bloco delimitado por tags no prompt:
+ *  < e > nunca aparecem em bruto, por isso o valor não consegue fechar o
+ *  bloco (</dados_lead>) nem abrir outro. */
+export function jsonForPromptBlock(value: unknown): string {
+  return JSON.stringify(value).replace(/</g, '\\u003c').replace(/>/g, '\\u003e')
 }
 
 /** Tira números de telefone e emails de texto livre (erros da Meta, logs). */

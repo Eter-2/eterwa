@@ -22,11 +22,11 @@
 
 import { z } from 'zod'
 import type { SupabaseClient } from '@supabase/supabase-js'
-import { normalizePhone, isValidE164 } from '@/lib/whatsapp/phone-utils'
+import { parsePhoneNumberFromString } from 'libphonenumber-js/max'
 import { isUniqueViolation } from '@/lib/contacts/dedupe'
 import { engineSendTemplate } from '@/lib/automations/meta-send'
 import { syncWebLeadToCrm } from '@/lib/crm/sync'
-import { notifyDemoLead } from '@/lib/notifications/notify-team'
+import { notifyDemoLead, notifyDemoCapWarning } from '@/lib/notifications/notify-team'
 import { firstNameForTemplate } from '@/lib/eter/followups'
 import { findOrCreateLeadContact, isTemplateNotReadyError, type NormalizedLead } from './leads'
 import { cleanField, hasControlChars, maskPii } from './lead-sanitize'
@@ -40,6 +40,9 @@ export const WEB_LEAD_DEDUPE_WINDOW_MS = 24 * 60 * 60 * 1000
 
 /** Tecto de templates (leads que ocupam telefone) por conta em 24 h. */
 export const WEB_LEAD_DAILY_CAP = 100
+
+/** A equipa é avisada quando o dia chega a 80% do tecto. */
+export const WEB_LEAD_CAP_WARNING = 80
 
 /** Leads em `template_pendente` mais velhas do que isto deixam de ser
  *  reenviadas: a lead é marcada como falhada e a equipa é avisada. */
@@ -100,18 +103,24 @@ export const webLeadSchema = z
 export type WebLeadInput = z.infer<typeof webLeadSchema>
 
 /**
- * Telefone do formulário → dígitos com indicativo, ou null se não for
- * utilizável. As landings são portuguesas: 9 dígitos a começar por 2 ou
- * 9 ganham o indicativo 351; "00" inicial é lido como "+".
+ * Telefone do formulário → dígitos com indicativo (E.164 sem "+"), ou
+ * null se não for um número válido. Usa o libphonenumber com Portugal
+ * como país por omissão (as landings são portuguesas), por isso
+ * "912 345 678", "+351 912 345 678" e "00351912345678" dão o mesmo
+ * resultado e prefixos/comprimentos impossíveis são recusados.
  */
 export function normalizeWebPhone(raw: string): string | null {
-  let digits = normalizePhone(raw)
-  if (!digits) return null
-  if (digits.startsWith('00')) digits = digits.slice(2)
-  if (digits.length === 9 && /^[29]/.test(digits)) digits = `351${digits}`
-  return isValidE164(digits) ? digits : null
+  const text = raw.trim().replace(/^00/, '+')
+  const parsed = parsePhoneNumberFromString(text, 'PT')
+  if (!parsed || !parsed.isValid()) return null
+  return parsed.number.replace(/^\+/, '')
 }
 
+/** Chave de comparação do telefone: últimos 9 dígitos (o mesmo número
+ *  escrito com ou sem indicativo ou zeros à frente é a mesma pessoa). */
+export function phoneSuffix(phone: string): string {
+  return phone.slice(-9)
+}
 export type WebLeadOutcome = 'processed' | 'duplicate' | 'invalid_phone' | 'rate_limited'
 
 export type WebLeadTemplateStatus =
@@ -229,12 +238,16 @@ async function hasTemplateMessage(
   db: SupabaseClient,
   conversationId: string,
   templateName: string,
+  sinceIso: string,
 ): Promise<boolean> {
+  // Só conta mensagens desde que ESTA lead foi criada: um template de uma
+  // demo anterior na mesma conversa não prova que este pedido foi servido.
   const { data, error } = await db
     .from('messages')
     .select('id')
     .eq('conversation_id', conversationId)
     .eq('template_name', templateName)
+    .gte('created_at', sinceIso)
     .limit(1)
   if (error) {
     console.error('[web leads] falha a verificar template já enviado:', error.message)
@@ -309,7 +322,7 @@ async function prepareDemoConversation(
   const findExisting = () =>
     db
       .from('conversations')
-      .select('id, source, assigned_agent_id')
+      .select('id, source, assigned_agent_id, team_requested_at')
       .eq('account_id', accountId)
       .eq('contact_id', contactId)
       .order('created_at', { ascending: true })
@@ -319,8 +332,16 @@ async function prepareDemoConversation(
   if (findErr) throw new Error(`falha a procurar conversa da lead do site: ${findErr.message}`)
 
   if (existingRows && existingRows.length > 0) {
-    const row = existingRows[0] as { id: string; source: string | null; assigned_agent_id: string | null }
+    const row = existingRows[0] as {
+      id: string
+      source: string | null
+      assigned_agent_id: string | null
+      team_requested_at: string | null
+    }
     if (row.assigned_agent_id) return { blocked: true }
+    // Demo já entregue à equipa: uma pessoa pode estar a tratar dela, não
+    // se volta a ligar a IA.
+    if (row.source === DEMO_CONVERSATION_SOURCE && row.team_requested_at) return { blocked: true }
 
     if (row.source !== DEMO_CONVERSATION_SOURCE) {
       const { data: msgs, error: msgErr } = await db
@@ -377,7 +398,7 @@ async function prepareDemoConversation(
 }
 
 function dedupeKey(phone: string, now: Date): string {
-  return `${phone}:${Math.floor(now.getTime() / WEB_LEAD_DEDUPE_WINDOW_MS)}`
+  return `${phoneSuffix(phone)}:${Math.floor(now.getTime() / WEB_LEAD_DEDUPE_WINDOW_MS)}`
 }
 
 export async function processWebLead(
@@ -400,7 +421,13 @@ export async function processWebLead(
     .in('template_status', [...OCCUPYING_STATUSES])
     .limit(WEB_LEAD_DAILY_CAP)
   if (capErr) throw new Error(`falha a verificar o tecto diário: ${capErr.message}`)
-  if ((occupying?.length ?? 0) >= WEB_LEAD_DAILY_CAP) {
+  const occupiedToday = occupying?.length ?? 0
+  if (occupiedToday === WEB_LEAD_CAP_WARNING || occupiedToday === WEB_LEAD_DAILY_CAP) {
+    void notifyDemoCapWarning({ accountId, count: occupiedToday, cap: WEB_LEAD_DAILY_CAP }).catch(
+      (err) => console.error('[web leads] aviso de tecto falhou:', maskPii(String(err))),
+    )
+  }
+  if (occupiedToday >= WEB_LEAD_DAILY_CAP) {
     console.error(`[web leads] tecto diário de ${WEB_LEAD_DAILY_CAP} leads atingido (account=${accountId}).`)
     return { outcome: 'rate_limited' }
   }
@@ -412,7 +439,7 @@ export async function processWebLead(
       .from('web_leads')
       .select('id, template_status')
       .eq('account_id', accountId)
-      .eq('telefone', phone)
+      .like('telefone', `%${phoneSuffix(phone)}`)
       .gte('created_at', since)
       .in('template_status', [...OCCUPYING_STATUSES])
       .order('created_at', { ascending: false })
@@ -519,6 +546,9 @@ export async function processWebLead(
       contact.id,
       {
         origem: input.source,
+        // Dados do formulário, fonte do convite da reunião (o modelo não os altera).
+        nome: input.nome,
+        email: input.email,
         empresa: input.empresa,
         n_comerciais: input.n_comerciais ?? null,
         utm: input.utm ?? null,
@@ -628,7 +658,19 @@ export async function retryPendingWebLeads(
       // (1) Presas em pending/sending.
       if (row.template_status !== 'template_pendente') {
         if (idle < STUCK_AFTER_MS) continue
-        if (row.conversation_id && (await hasTemplateMessage(db, row.conversation_id, templateName))) {
+        // Recolha condicional: só quem ainda encontra a linha no mesmo
+        // estado e sem actividade nova a recolhe (um envio lento que
+        // acabou entretanto não é pisado).
+        const { data: reclaimed, error: reclaimErr } = await db
+          .from('web_leads')
+          .update({ template_status: row.template_status })
+          .eq('id', row.id)
+          .eq('account_id', row.account_id)
+          .eq('template_status', row.template_status)
+          .eq('updated_at', row.updated_at)
+          .select('id')
+        if (reclaimErr || !reclaimed || reclaimed.length === 0) continue
+        if (row.conversation_id && (await hasTemplateMessage(db, row.conversation_id, templateName, row.created_at))) {
           await setTemplateStatus(db, row.account_id, row.id, 'sent', { template_name: templateName })
           result.sent++
         } else if (row.contact_id && row.conversation_id) {
@@ -677,7 +719,7 @@ export async function retryPendingWebLeads(
         .select('id')
       if (claimErr || !claimed || claimed.length === 0) continue
 
-      if (row.conversation_id && (await hasTemplateMessage(db, row.conversation_id, templateName))) {
+      if (row.conversation_id && (await hasTemplateMessage(db, row.conversation_id, templateName, row.created_at))) {
         await setTemplateStatus(db, row.account_id, row.id, 'sent', { template_name: templateName })
         result.sent++
         continue

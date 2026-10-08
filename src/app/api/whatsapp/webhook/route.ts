@@ -1,5 +1,6 @@
 import { NextResponse, after } from 'next/server'
 import { createClient } from '@supabase/supabase-js'
+import { demoTemplateName } from '@/lib/meta/demo-template'
 import { decrypt, encrypt, isLegacyFormat } from '@/lib/whatsapp/encryption'
 import { getMediaUrl, downloadMedia } from '@/lib/whatsapp/meta-api'
 import { normalizePhone } from '@/lib/whatsapp/phone-utils'
@@ -1240,11 +1241,25 @@ async function parseMessageContent(
     case 'reaction':
       return { ...empty, contentText: message.reaction?.emoji || null }
 
-    case 'button':
-      // Toque num botão QUICK_REPLY de um template: guarda o texto do
-      // botão como se a pessoa o tivesse escrito, para a IA e o inbox o
-      // lerem (antes caía em "[Unsupported message type: button]").
-      return { ...empty, contentText: message.button?.text || message.button?.payload || null }
+    case 'button': {
+      // Toque num botão QUICK_REPLY de um template. Só o template de demo
+      // do site (eter_demo_web_v1) passa a texto, e só se a mensagem a que
+      // responde (context.id) foi mesmo esse template nosso; qualquer outro
+      // botão mantém o comportamento anterior.
+      const replyText = message.button?.text || message.button?.payload || null
+      if (replyText && message.context?.id) {
+        const { data: parent } = await supabaseAdmin()
+          .from('messages')
+          .select('template_name')
+          .eq('message_id', message.context.id)
+          .limit(1)
+        const parentTemplate = (parent as { template_name?: string | null }[] | null)?.[0]?.template_name
+        if (parentTemplate && parentTemplate === demoTemplateName()) {
+          return { ...empty, contentText: replyText }
+        }
+      }
+      return { ...empty, contentText: `[Unsupported message type: ${message.type}]` }
+    }
 
     case 'interactive': {
       // The customer tapped a reply button or a list row on a message

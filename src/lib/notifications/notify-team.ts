@@ -98,26 +98,20 @@ function formatDateTime(date: Date, timezone: string): string {
   }
 }
 
-function truncateQuote(text: string, max: number): string {
-  const collapsed = text.replace(/\s+/g, ' ').trim()
-  if (collapsed.length <= max) return collapsed
-  return `${collapsed.slice(0, max - 1).trimEnd()}…`
-}
-
 function buildHandoffMattermostText(input: HandoffNotifyInput): string {
   const lines = [
     ':rotating_light: **Handoff — conversa passada à equipa**',
-    `Nome: ${input.contactName ?? 'desconhecido'}`,
-    `Empresa: ${input.company ?? 'desconhecida'}`,
-    `Telefone: ${input.phone ?? 'desconhecido'}`,
-    `Email: ${input.email ?? 'desconhecido'}`,
-    `Motivo: ${input.reason ?? 'não indicado'}`,
+    `Nome: ${input.contactName ? safeForNotification(input.contactName) : 'desconhecido'}`,
+    `Empresa: ${input.company ? safeForNotification(input.company) : 'desconhecida'}`,
+    `Telefone: ${input.phone ? safeForNotification(input.phone, 20) : 'desconhecido'}`,
+    `Email: ${input.email ? safeForNotification(input.email, 120) : 'desconhecido'}`,
+    `Motivo: ${input.reason ? safeForNotification(input.reason, 200) : 'não indicado'}`,
   ]
   if (input.lastMessages.length > 0) {
     lines.push('', 'Últimas mensagens:')
     for (const m of input.lastMessages.slice(-3)) {
       const who = m.role === 'user' ? 'Lead' : 'Agente'
-      lines.push(`- ${who}: ${truncateQuote(m.content, 200)}`)
+      lines.push(`- ${who}: ${safeForNotification(m.content, 200)}`)
     }
   }
   lines.push('', `Conversa: ${input.conversationUrl}`)
@@ -126,10 +120,10 @@ function buildHandoffMattermostText(input: HandoffNotifyInput): string {
 
 function buildHandoffWhatsAppText(input: HandoffNotifyInput): string {
   const parts = [
-    `Handoff: ${input.contactName ?? 'lead desconhecido'}`,
-    input.company ? `(${input.company})` : null,
-    input.phone ? `tel ${input.phone}` : null,
-    input.reason ? `motivo: ${truncateQuote(input.reason, 80)}` : null,
+    `Handoff: ${input.contactName ? cleanField(input.contactName) : 'lead desconhecido'}`,
+    input.company ? `(${cleanField(input.company)})` : null,
+    input.phone ? `tel ${cleanField(input.phone, 20)}` : null,
+    input.reason ? `motivo: ${cleanField(input.reason, 80)}` : null,
     input.conversationUrl,
   ].filter(Boolean)
   return parts.join(' — ')
@@ -138,8 +132,8 @@ function buildHandoffWhatsAppText(input: HandoffNotifyInput): string {
 function buildMeetingMattermostText(input: MeetingNotifyInput): string {
   const lines = [
     ':calendar: **Reunião comercial marcada**',
-    `Nome: ${input.contactName ?? 'desconhecido'}`,
-    `Empresa: ${input.company ?? 'desconhecida'}`,
+    `Nome: ${input.contactName ? safeForNotification(input.contactName) : 'desconhecido'}`,
+    `Empresa: ${input.company ? safeForNotification(input.company) : 'desconhecida'}`,
     `Quando: ${formatDateTime(input.startsAt, input.timezone)}`,
   ]
   if (input.eventUrl) lines.push(`Evento: ${input.eventUrl}`)
@@ -148,8 +142,8 @@ function buildMeetingMattermostText(input: MeetingNotifyInput): string {
 
 function buildMeetingWhatsAppText(input: MeetingNotifyInput): string {
   const parts = [
-    `Reunião marcada: ${input.contactName ?? 'lead desconhecido'}`,
-    input.company ? `(${input.company})` : null,
+    `Reunião marcada: ${input.contactName ? cleanField(input.contactName) : 'lead desconhecido'}`,
+    input.company ? `(${cleanField(input.company)})` : null,
     formatDateTime(input.startsAt, input.timezone),
     input.eventUrl,
   ].filter(Boolean)
@@ -389,4 +383,23 @@ export async function notifyDemoLead(input: DemoLeadNotifyInput): Promise<Notify
     }),
   ])
   return { mattermost, whatsapp }
+}
+
+export interface DemoCapWarningInput {
+  accountId: string
+  count: number
+  cap: number
+}
+
+/** Avisa a equipa de que o tecto diário de leads do site está a chegar
+ *  (80%) ou foi atingido. Best-effort, nunca lança. */
+export async function notifyDemoCapWarning(input: DemoCapWarningInput): Promise<void> {
+  const reached = input.count >= input.cap
+  const text = reached
+    ? `Tecto diário de leads do site atingido (${input.count}/${input.cap}): novos pedidos recusados até baixar. Verificar se há abuso.`
+    : `Leads do site a chegar ao tecto diário (${input.count}/${input.cap}). Verificar se há abuso.`
+  await Promise.all([
+    postToMattermost(`:warning: ${text}`).catch(() => undefined),
+    sendToConfiguredNumbers(input.accountId, text).catch(() => undefined),
+  ])
 }

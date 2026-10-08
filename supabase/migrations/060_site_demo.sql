@@ -93,7 +93,8 @@ ALTER TABLE web_leads ENABLE ROW LEVEL SECURITY;
 -- Só o service role escreve (o endpoint); membros da conta só leem; o
 -- papel anon não vê nada (contém PII e prova de consentimento).
 REVOKE ALL ON TABLE web_leads FROM anon;
-REVOKE INSERT, UPDATE, DELETE ON TABLE web_leads FROM authenticated;
+REVOKE ALL ON TABLE web_leads FROM authenticated;
+GRANT SELECT ON TABLE web_leads TO authenticated;
 
 DROP POLICY IF EXISTS web_leads_select ON web_leads;
 CREATE POLICY web_leads_select ON web_leads FOR SELECT
