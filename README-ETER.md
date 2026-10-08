@@ -38,6 +38,118 @@ agente vai ser construído:
   por causa de uma guarda de segurança do harness sobre ficheiros
   `.env*`.
 
+## Lead do site → template → demo ao vivo → reunião
+
+Fluxo das landings da Vera (`lp-vera-whatsapp`, `lp-vera-linkedin`):
+formulário → `POST /api/leads/web` → template `eter_demo_web_v1` no
+WhatsApp da lead → a lead responde "Olá" → a Vera corre em **modo demo**
+(simulação de atendimento, qualificação, marcação da reunião com o
+Ricardo).
+
+### Variáveis de ambiente
+
+Vão para o `.env.local` do servidor (nunca para o repo). Nota: o
+`.env.local.example` não pôde ser editado pelo harness (guarda sobre
+ficheiros `.env*`); acrescentar `LEADS_WEB_KEY=` lá à mão.
+
+| Variável | Obrigatória | Para quê |
+|---|---|---|
+| `LEADS_WEB_KEY` | sim | Chave partilhada com o servidor do site (header `X-Lead-Key`). Sem ela o endpoint responde 503. `openssl rand -hex 32`. O site guarda o mesmo valor no `.env` do seu servidor. |
+| `LEADS_WEB_ACCOUNT_ID` | não | Conta dona do número da Vera. Sem isto só é aceite se existir exactamente uma `whatsapp_config`. |
+| `DEMO_TEMPLATE_NAME` | não | Nome do template de abertura. Por omissão `eter_demo_web_v1`. |
+| `TWENTY_PERSON_ORIGIN_FIELD` | não | Nome do campo da Person no Twenty onde gravar a origem `site_demo`. Sem isto a origem não vai para o Twenty (fica em `web_leads` e na conversa). |
+| `MATTERMOST_WEBHOOK_URL`, `ai_configs.notify_phone_numbers` | já existem | Avisos da lead nova ao Ricardo (mesmo canal dos handoffs). |
+
+Migração a aplicar **antes** do deploy: `supabase/migrations/060_site_demo.sql`
+(tabela `web_leads` e coluna `conversations.demo_context`).
+
+### Contrato do endpoint (para o site)
+
+`POST https://eterwa.etergrowth.com/api/leads/web`, chamado pelo
+**servidor** do site, nunca pelo browser (a chave não pode ir para o
+cliente).
+
+Headers: `Content-Type: application/json`, `X-Lead-Key: <LEADS_WEB_KEY>`,
+e opcionalmente `X-Forwarded-For: <ip do visitante>` (rate limit por IP,
+30/min; global 120/min).
+
+```json
+{
+  "nome": "Duarte Silva",
+  "telefone": "912 345 678",
+  "email": "duarte@exemplo.pt",
+  "empresa": "Plásticos do Norte",
+  "n_comerciais": "3-5",
+  "source": "lp-vera-whatsapp",
+  "consentimento_whatsapp": true,
+  "utm": { "utm_source": "linkedin", "utm_campaign": "vera" },
+  "event_id": "evt_abc123"
+}
+```
+
+- Obrigatórios: `nome`, `telefone`, `email`, `empresa`, `source`
+  (`lp-vera-whatsapp` ou `lp-vera-linkedin`), `consentimento_whatsapp`
+  (boolean, presente). Opcionais: `n_comerciais` (texto, ex. `1-2`, `3-5`,
+  `6-10`, `Mais de 10`), `utm` (até 20 chaves), `event_id`.
+- Telefone: 9 dígitos portugueses ganham o indicativo 351; `+351...` e
+  `00351...` também servem.
+- Idempotência: o mesmo `event_id`, ou o mesmo telefone nas últimas 24 h,
+  devolve `{"ok":true,"status":"duplicate"}` e não envia nada.
+
+Respostas:
+
+| HTTP | Corpo | Significa |
+|---|---|---|
+| 200 | `{"ok":true,"status":"sent"}` | Template enviado. |
+| 200 | `{"ok":true,"status":"template_pendente"}` | Template ainda não aprovado pela Meta; reenvia sozinho (cron) quando for. |
+| 200 | `{"ok":true,"status":"skipped_no_consent"}` | `consentimento_whatsapp: false`: registada, nada enviado, o Ricardo é avisado para contactar por email. |
+| 200 | `{"ok":true,"status":"duplicate"}` | Já recebida. |
+| 200 | `{"ok":true,"status":"failed"}` | Registada, mas o envio falhou (ver `web_leads.template_error`). |
+| 400 | `{"error":"Validation failed","issues":[...]}` | Corpo inválido (só caminhos, nunca os valores). |
+| 401 | | Chave em falta ou errada. |
+| 413 | | Corpo > 8 KB. |
+| 422 | `{"status":"invalid_phone"}` | Telefone inutilizável (registada, nada enviado). |
+| 429 | | Rate limit. |
+| 503 | | `LEADS_WEB_KEY` não definida ou conta não resolvida. |
+
+### Template `eter_demo_web_v1`
+
+Categoria MARKETING, `pt_PT`, botão QUICK_REPLY "Olá". Texto e payload em
+`src/lib/meta/demo-template.ts` (editar o texto implica nova aprovação
+da Meta). Submeter e consultar o estado: `scripts/submit-demo-template.ts`
+(instruções no cabeçalho do ficheiro; `--submit` e `--status`).
+
+### Modo demo da Vera
+
+Conversas com `conversations.source = 'site_demo'` usam
+`src/lib/ai/demo.ts` em vez do prompt comercial: não pergunta o nome,
+pergunta sector/produto/tipo de pedido, faz a simulação (4 a 6
+mensagens), qualifica a lead real (`save_demo_qualification`, guardado em
+`conversations.demo_context`) e marca a reunião com
+`check_commercial_availability` / `book_commercial_meeting` (a agenda
+comercial já configurada). Tratamento por "tu", sem preços nem prazos
+inventados, passa a humano se pedirem. O tecto de respostas da IA nestas
+conversas é no mínimo 40.
+
+### Como testar
+
+```bash
+npm ci
+npx vitest run src/lib/meta/web-leads.test.ts src/lib/ai/demo.test.ts \
+  src/app/api/leads/web/route.test.ts   # unitários e conversa simulada (LLM falso)
+```
+
+Teste real (só com OK do Ricardo, e apenas com o número dele): com a
+migração aplicada, o branch em staging/produção e o template aprovado,
+
+```bash
+curl -s -X POST https://eterwa.etergrowth.com/api/leads/web \
+  -H "Content-Type: application/json" -H "X-Lead-Key: $LEADS_WEB_KEY" \
+  -d '{"nome":"Ricardo","telefone":"<número do Ricardo>","email":"ricardo@etershield.com","empresa":"Teste","source":"lp-vera-whatsapp","consentimento_whatsapp":true}'
+```
+
+(`LEADS_WEB_KEY` lida do `.env`, nunca escrita no comando.)
+
 ## O que ainda NÃO existe
 
 1. Tool-calling real no LLM (hoje `src/lib/ai/generate.ts` só produz
