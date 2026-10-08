@@ -120,6 +120,11 @@ export async function POST(request: Request) {
 
   const parsed = webLeadSchema.safeParse(json)
   if (!parsed.success) {
+    // Só caminhos e mensagens (nunca valores) para diagnosticar o site.
+    console.warn(
+      '[leads web] validação falhou:',
+      parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; '),
+    )
     return NextResponse.json(
       {
         error: 'Validation failed',

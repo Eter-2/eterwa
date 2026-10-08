@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import type { AiConfig } from './types'
 import { __resetRateLimitForTests } from '@/lib/rate-limit'
 
@@ -1237,5 +1237,44 @@ describe('dispatchInboundToAiReply — modo demo (source site_demo)', () => {
     await dispatchInboundToAiReply(ARGS)
 
     expect(h.engineSendText).not.toHaveBeenCalled()
+  })
+})
+
+describe('dispatchInboundToAiReply: número de teste da demo (DEMO_TEST_PHONES)', () => {
+  afterEach(() => {
+    delete process.env.DEMO_TEST_PHONES
+  })
+
+  it('um número da equipa em conversa site_demo recebe a demo se estiver em DEMO_TEST_PHONES', async () => {
+    process.env.DEMO_TEST_PHONES = '351912345678'
+    h.state.conv = commercialConv({ source: 'site_demo' })
+    h.state.contactPhone = '351912345678'
+    h.loadAiConfig.mockResolvedValue(commercialConfig({ teamPhoneNumbers: ['351912345678'] }))
+
+    await dispatchInboundToAiReply(ARGS)
+
+    const call = h.generateReplyWithTools.mock.calls[0][0] as { systemPrompt: string }
+    expect(call.systemPrompt).toContain('demonstração AO VIVO')
+  })
+
+  it('sem a env, o mesmo número da equipa continua no assistente interno', async () => {
+    h.state.conv = commercialConv({ source: 'site_demo' })
+    h.state.contactPhone = '351912345678'
+    h.loadAiConfig.mockResolvedValue(commercialConfig({ teamPhoneNumbers: ['351912345678'] }))
+
+    await dispatchInboundToAiReply(ARGS)
+
+    expect(h.generateReplyWithTools).not.toHaveBeenCalled()
+  })
+
+  it('o bypass só vale em conversas site_demo', async () => {
+    process.env.DEMO_TEST_PHONES = '351912345678'
+    h.state.conv = commercialConv({ source: 'direct' })
+    h.state.contactPhone = '351912345678'
+    h.loadAiConfig.mockResolvedValue(commercialConfig({ teamPhoneNumbers: ['351912345678'] }))
+
+    await dispatchInboundToAiReply(ARGS)
+
+    expect(h.generateReplyWithTools).not.toHaveBeenCalled()
   })
 })

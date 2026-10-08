@@ -32,6 +32,7 @@ import { findOrCreateLeadContact, isTemplateNotReadyError, type NormalizedLead }
 import { cleanField, hasControlChars, maskPii } from './lead-sanitize'
 import { DEMO_CONVERSATION_SOURCE } from '@/lib/ai/demo'
 import { DEMO_TEMPLATE_LANGUAGE, demoTemplateName } from './demo-template'
+import { isDemoTestPhone } from './demo-test-phones'
 
 export const WEB_LEAD_SOURCES = ['lp-vera-whatsapp', 'lp-vera-linkedin'] as const
 
@@ -74,31 +75,61 @@ const utmSchema = z
   .record(noControl(60), noControl(300, 0))
   .refine((o) => Object.keys(o).length <= 20, { message: 'utm: demasiadas chaves' })
 
-export const webLeadSchema = z
-  .object({
-    nome: noControl(120),
-    telefone: noControl(40),
-    email: noControl(200).pipe(z.email()),
-    empresa: noControl(160),
-    n_comerciais: noControl(40).optional(),
-    source: z.enum(WEB_LEAD_SOURCES),
-    consentimento_whatsapp: z.boolean(),
-    // Prova de consentimento: texto da checkbox e página onde foi dada.
-    consentimento_texto: noControl(500, 10).optional(),
-    pagina_url: noControl(300).pipe(z.url()).optional(),
-    user_agent: noControl(300).optional(),
-    ip_visitante: noControl(45).optional(),
-    utm: utmSchema.optional(),
-    event_id: noControl(100).optional(),
-  })
-  .superRefine((v, ctx) => {
-    if (v.consentimento_whatsapp && !v.consentimento_texto) {
-      ctx.addIssue({ code: 'custom', path: ['consentimento_texto'], message: 'obrigatório com consentimento' })
+/** null e "" contam como ausente nos campos opcionais (o site envia
+ *  `event_id: null` e `n_comerciais: ""` quando não há valor). */
+const blankToUndefined = (v: unknown) => (v === null || v === '' ? undefined : v)
+
+export const webLeadSchema = z.preprocess(
+  (raw) => {
+    if (!raw || typeof raw !== 'object') return raw
+    const o = { ...(raw as Record<string, unknown>) }
+    for (const k of [
+      'n_comerciais',
+      'event_id',
+      'utm',
+      'user_agent',
+      'ip_visitante',
+      'consentimento_texto',
+      'pagina_url',
+    ]) {
+      o[k] = blankToUndefined(o[k])
     }
-    if (v.consentimento_whatsapp && !v.pagina_url) {
-      ctx.addIssue({ code: 'custom', path: ['pagina_url'], message: 'obrigatório com consentimento' })
-    }
-  })
+    return o
+  },
+  z
+    .object({
+      nome: noControl(120),
+      telefone: noControl(40),
+      email: noControl(200).pipe(z.email()),
+      empresa: noControl(160),
+      n_comerciais: noControl(40).optional(),
+      source: z.enum(WEB_LEAD_SOURCES),
+      consentimento_whatsapp: z.boolean(),
+      // Prova de consentimento: texto da checkbox e página onde foi dada.
+      consentimento_texto: noControl(500, 10).optional(),
+      pagina_url: noControl(300).pipe(z.url()).optional(),
+      user_agent: noControl(300).optional(),
+      ip_visitante: noControl(45).optional(),
+      utm: utmSchema.optional(),
+      event_id: noControl(100).optional(),
+    })
+    .superRefine((v, ctx) => {
+      if (v.consentimento_whatsapp && !v.consentimento_texto) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['consentimento_texto'],
+          message: 'obrigatório com consentimento',
+        })
+      }
+      if (v.consentimento_whatsapp && !v.pagina_url) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['pagina_url'],
+          message: 'obrigatório com consentimento',
+        })
+      }
+    }),
+)
 
 export type WebLeadInput = z.infer<typeof webLeadSchema>
 
@@ -216,7 +247,8 @@ async function setTemplateStatus(
   extra: Record<string, unknown> = {},
 ): Promise<void> {
   const patch: Record<string, unknown> = { template_status: status, ...extra }
-  if (typeof patch.template_error === 'string') patch.template_error = maskPii(patch.template_error).slice(0, 500)
+  if (typeof patch.template_error === 'string')
+    patch.template_error = maskPii(patch.template_error).slice(0, 500)
   // Ao falhar ou saltar, o telefone fica livre para um novo pedido.
   if (FREEING_STATUSES.includes(status)) patch.dedupe_key = null
   const { error } = await db
@@ -318,6 +350,7 @@ async function prepareDemoConversation(
   contactId: string,
   demoContext: Record<string, unknown>,
   reason: string,
+  opts: { archiveExisting?: boolean; contactName?: string | null } = {},
 ): Promise<DemoConversation> {
   const findExisting = () =>
     db
@@ -330,6 +363,37 @@ async function prepareDemoConversation(
 
   const { data: existingRows, error: findErr } = await findExisting()
   if (findErr) throw new Error(`falha a procurar conversa da lead do site: ${findErr.message}`)
+
+  if (existingRows && existingRows.length > 0 && opts.archiveExisting) {
+    // Número de teste (DEMO_TEST_PHONES): arquiva a conversa anterior e
+    // cria uma nova. Há uma só conversa por contacto (UNIQUE account_id,
+    // contact_id), por isso a antiga muda para um contacto de arquivo, com
+    // todas as mensagens intactas, e fecha-se. Reversível: basta repor o
+    // contact_id.
+    const oldId = (existingRows[0] as { id: string }).id
+    const stamp = new Date().toISOString().slice(0, 16).replace('T', ' ')
+    const { data: archive, error: archErr } = await db
+      .from('contacts')
+      .insert({
+        account_id: accountId,
+        user_id: userId,
+        phone: `000${Date.now()}${Math.floor(Math.random() * 900 + 100)}`,
+        name: `[arquivo ${stamp}] ${cleanField(opts.contactName, 60) || 'teste'}`,
+      })
+      .select('id')
+      .single()
+    if (archErr || !archive) {
+      throw new Error(`falha a criar o contacto de arquivo: ${archErr?.message ?? 'sem id'}`)
+    }
+    const { error: moveErr } = await db
+      .from('conversations')
+      .update({ contact_id: (archive as { id: string }).id, status: 'closed' })
+      .eq('id', oldId)
+      .eq('account_id', accountId)
+    if (moveErr) throw new Error(`falha a arquivar a conversa anterior: ${moveErr.message}`)
+    console.log(`[web leads] conversa ${oldId} arquivada (número de teste), nova conversa a criar.`)
+    existingRows.length = 0
+  }
 
   if (existingRows && existingRows.length > 0) {
     const row = existingRows[0] as {
@@ -428,13 +492,16 @@ export async function processWebLead(
     )
   }
   if (occupiedToday >= WEB_LEAD_DAILY_CAP) {
-    console.error(`[web leads] tecto diário de ${WEB_LEAD_DAILY_CAP} leads atingido (account=${accountId}).`)
+    console.error(
+      `[web leads] tecto diário de ${WEB_LEAD_DAILY_CAP} leads atingido (account=${accountId}).`,
+    )
     return { outcome: 'rate_limited' }
   }
 
   // Dedupe por telefone numa janela de 24 h: só conta quem ainda ocupa o
   // telefone (um envio falhado não bloqueia uma nova tentativa).
-  if (phone) {
+  const isTest = isDemoTestPhone(phone)
+  if (phone && !isTest) {
     const { data: recent, error: recentErr } = await db
       .from('web_leads')
       .select('id, template_status')
@@ -444,7 +511,8 @@ export async function processWebLead(
       .in('template_status', [...OCCUPYING_STATUSES])
       .order('created_at', { ascending: false })
       .limit(1)
-    if (recentErr) throw new Error(`falha a verificar duplicados em web_leads: ${recentErr.message}`)
+    if (recentErr)
+      throw new Error(`falha a verificar duplicados em web_leads: ${recentErr.message}`)
     if (recent && recent.length > 0) {
       const row = recent[0] as { id: string; template_status: WebLeadTemplateStatus }
       return { outcome: 'duplicate', webLeadId: row.id, templateStatus: row.template_status }
@@ -481,7 +549,7 @@ export async function processWebLead(
       consent_user_agent: consent ? (input.user_agent ?? null) : null,
       consent_visitor_ip: consent ? (input.ip_visitante ?? null) : null,
       consent_request_ip: consent ? (meta.requestIp ?? null) : null,
-      dedupe_key: initialStatus === 'pending' && phone ? dedupeKey(phone, now) : null,
+      dedupe_key: initialStatus === 'pending' && phone && !isTest ? dedupeKey(phone, now) : null,
       template_status: initialStatus,
     })
     .select('id')
@@ -555,6 +623,7 @@ export async function processWebLead(
         web_lead_id: webLeadId,
       },
       `Pediu a demo da Vera no site (${input.source})${input.n_comerciais ? `, ${input.n_comerciais} comerciais` : ''}`,
+      { archiveExisting: isTest, contactName: input.nome },
     )
 
     if ('blocked' in conversation) {
@@ -670,8 +739,13 @@ export async function retryPendingWebLeads(
           .eq('updated_at', row.updated_at)
           .select('id')
         if (reclaimErr || !reclaimed || reclaimed.length === 0) continue
-        if (row.conversation_id && (await hasTemplateMessage(db, row.conversation_id, templateName, row.created_at))) {
-          await setTemplateStatus(db, row.account_id, row.id, 'sent', { template_name: templateName })
+        if (
+          row.conversation_id &&
+          (await hasTemplateMessage(db, row.conversation_id, templateName, row.created_at))
+        ) {
+          await setTemplateStatus(db, row.account_id, row.id, 'sent', {
+            template_name: templateName,
+          })
           result.sent++
         } else if (row.contact_id && row.conversation_id) {
           await setTemplateStatus(db, row.account_id, row.id, 'template_pendente')
@@ -686,7 +760,10 @@ export async function retryPendingWebLeads(
 
       // (3) Expirada.
       if (age > WEB_LEAD_RETRY_MAX_AGE_MS || row.template_attempts >= RETRY_MAX_ATTEMPTS) {
-        if (row.template_attempts >= RETRY_MAX_ATTEMPTS && idle < RETRY_BACKOFF_MS[RETRY_MAX_ATTEMPTS - 1]) {
+        if (
+          row.template_attempts >= RETRY_MAX_ATTEMPTS &&
+          idle < RETRY_BACKOFF_MS[RETRY_MAX_ATTEMPTS - 1]
+        ) {
           continue // dá à última tentativa o seu tempo antes de desistir
         }
         await setTemplateStatus(db, row.account_id, row.id, 'failed', {
@@ -703,7 +780,9 @@ export async function retryPendingWebLeads(
           email: row.email,
           templateStatus: 'expired',
           conversationUrl: null,
-        }).catch((err) => console.error('[web leads] aviso de expiração falhou:', maskPii(String(err))))
+        }).catch((err) =>
+          console.error('[web leads] aviso de expiração falhou:', maskPii(String(err))),
+        )
         continue
       }
 
@@ -719,7 +798,10 @@ export async function retryPendingWebLeads(
         .select('id')
       if (claimErr || !claimed || claimed.length === 0) continue
 
-      if (row.conversation_id && (await hasTemplateMessage(db, row.conversation_id, templateName, row.created_at))) {
+      if (
+        row.conversation_id &&
+        (await hasTemplateMessage(db, row.conversation_id, templateName, row.created_at))
+      ) {
         await setTemplateStatus(db, row.account_id, row.id, 'sent', { template_name: templateName })
         result.sent++
         continue
@@ -735,7 +817,10 @@ export async function retryPendingWebLeads(
       else result.failed++
     }
   } catch (err) {
-    console.error('[web leads] retry falhou:', maskPii(err instanceof Error ? err.message : String(err)))
+    console.error(
+      '[web leads] retry falhou:',
+      maskPii(err instanceof Error ? err.message : String(err)),
+    )
   }
   return result
 }

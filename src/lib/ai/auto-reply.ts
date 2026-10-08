@@ -38,6 +38,7 @@ import {
   isDemoConversation,
   loadDemoContext,
 } from './demo'
+import { isDemoTestPhone } from '@/lib/meta/demo-test-phones'
 import type { GenerateResult } from './types'
 
 /** Base do link da conversa no EterWA, usado no aviso de handoff
@@ -152,7 +153,15 @@ export async function dispatchInboundToAiReply(
       .select('phone, name, email, company')
       .eq('id', contactId)
       .maybeSingle()
-    const isCommercial = isCommercialConversation(config, contactRow?.phone ?? null)
+    // Número de teste da demo (DEMO_TEST_PHONES) numa conversa site_demo:
+    // ignora a classificação de equipa para o Ricardo ver a demo no
+    // próprio número.
+    const demoTestBypass =
+      isDemoConversation(conv.source as string | null) && isDemoTestPhone(contactRow?.phone)
+    const isCommercial = isCommercialConversation(
+      config,
+      demoTestBypass ? null : (contactRow?.phone ?? null),
+    )
 
     // Bloco 3-A — limite de mensagens antes de a IA responder (migração
     // 054). Corre DEPOIS de a mensagem já estar guardada em `messages`

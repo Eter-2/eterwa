@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { makeFakeDb, type FakeDb } from './fake-db.test-util'
 
 const engineSendTemplateMock = vi.fn()
@@ -472,6 +472,17 @@ describe('processWebLead: concorrência, tecto e dedupe', () => {
   })
 })
 
+describe('webLeadSchema: o que o site envia', () => {
+  it('event_id null e n_comerciais "" contam como ausentes', () => {
+    const r = webLeadSchema.safeParse({ ...INPUT, event_id: null, n_comerciais: '', utm: {} })
+    expect(r.success).toBe(true)
+    if (r.success) {
+      expect(r.data.event_id).toBeUndefined()
+      expect(r.data.n_comerciais).toBeUndefined()
+    }
+  })
+})
+
 describe('webLeadSchema: texto não confiável e consentimento', () => {
   it('rejeita caracteres de controlo e quebras de linha em qualquer campo de texto', () => {
     for (const field of ['nome', 'empresa', 'n_comerciais', 'telefone', 'event_id'] as const) {
@@ -643,5 +654,84 @@ describe('retryPendingWebLeads', () => {
     const out = await retryPendingWebLeads(db.client, after(11 * MIN))
     expect(out.sent).toBe(1)
     expect(db.tables.web_leads[0].template_status).toBe('sent')
+  })
+})
+
+describe('DEMO_TEST_PHONES: números de teste', () => {
+  beforeEach(() => {
+    process.env.DEMO_TEST_PHONES = '+351 912 345 678, 351999000111'
+  })
+  afterEach(() => {
+    delete process.env.DEMO_TEST_PHONES
+  })
+
+  function seedExisting() {
+    db.tables.contacts.push({ id: 'c-1', account_id: 'acct-1', phone: '351912345678', name: 'Ricardo' })
+    db.tables.conversations.push({
+      id: 'cv-old',
+      account_id: 'acct-1',
+      contact_id: 'c-1',
+      source: 'direct',
+      status: 'open',
+      assigned_agent_id: 'agent-1',
+      team_requested_at: '2026-10-01T10:00:00Z',
+    })
+    db.tables.messages = [{ id: 'm-1', conversation_id: 'cv-old', content_text: 'olá' }]
+  }
+
+  it('arquiva (não apaga) a conversa anterior e cria uma nova em modo demo', async () => {
+    seedExisting()
+
+    const result = await processWebLead(db.client, ACCOUNT, INPUT)
+
+    expect(result.templateStatus).toBe('sent')
+    const old = db.tables.conversations.find((c) => c.id === 'cv-old')!
+    expect(old.status).toBe('closed')
+    expect(old.contact_id).not.toBe('c-1')
+    // As mensagens e a conversa antiga continuam lá.
+    expect(db.tables.messages).toHaveLength(1)
+    const archive = db.tables.contacts.find((c) => c.id === old.contact_id)!
+    expect(String(archive.name)).toContain('[arquivo')
+    expect(String(archive.phone)).toMatch(/^000/)
+
+    const fresh = db.tables.conversations.find((c) => c.id !== 'cv-old')!
+    expect(fresh).toMatchObject({ contact_id: 'c-1', source: 'site_demo' })
+    expect(fresh.assigned_agent_id).toBeUndefined()
+    expect(fresh.team_requested_at).toBeUndefined()
+    expect(engineSendTemplateMock).toHaveBeenCalledWith(
+      expect.objectContaining({ conversationId: fresh.id, contactId: 'c-1' }),
+    )
+  })
+
+  it('o dedupe de 24 h não se aplica: dá para repetir o teste', async () => {
+    await processWebLead(db.client, ACCOUNT, INPUT)
+    const again = await processWebLead(db.client, ACCOUNT, INPUT)
+    expect(again.outcome).toBe('processed')
+    expect(again.templateStatus).toBe('sent')
+    expect(engineSendTemplateMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('o tecto diário continua a valer para números de teste', async () => {
+    const recent = new Date().toISOString()
+    for (let i = 0; i < WEB_LEAD_DAILY_CAP; i++) {
+      db.tables.web_leads.push({ id: `wl-${i}`, account_id: 'acct-1', template_status: 'sent', created_at: recent, updated_at: recent })
+    }
+    expect((await processWebLead(db.client, ACCOUNT, INPUT)).outcome).toBe('rate_limited')
+  })
+
+  it('outros números mantêm o bloqueio de conversa existente', async () => {
+    db.tables.contacts.push({ id: 'c-2', account_id: 'acct-1', phone: '351934111222', name: 'Outro' })
+    db.tables.conversations.push({ id: 'cv-2', account_id: 'acct-1', contact_id: 'c-2', source: 'direct' })
+    db.tables.messages = [{ id: 'm-2', conversation_id: 'cv-2' }]
+    const result = await processWebLead(db.client, ACCOUNT, { ...INPUT, telefone: '934 111 222' })
+    expect(result.templateStatus).toBe('skipped_existing_conversation')
+    expect(db.tables.conversations).toHaveLength(1)
+  })
+
+  it('sem a env nada muda para o mesmo número', async () => {
+    delete process.env.DEMO_TEST_PHONES
+    seedExisting()
+    const result = await processWebLead(db.client, ACCOUNT, INPUT)
+    expect(result.templateStatus).toBe('skipped_existing_conversation')
   })
 })
