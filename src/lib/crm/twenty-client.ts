@@ -33,6 +33,11 @@ function getTwentyConfig(): TwentyConfig | null {
   return { baseUrl: baseUrl.replace(/\/+$/, ''), apiKey }
 }
 
+function originFieldName(): string | null {
+  const name = process.env.TWENTY_PERSON_ORIGIN_FIELD?.trim()
+  return name && /^[A-Za-z][A-Za-z0-9_]*$/.test(name) ? name : null
+}
+
 /**
  * Splits a WhatsApp profile name into Twenty's FULL_NAME shape
  * (firstName/lastName). Twenty requires both sub-fields to be
@@ -61,6 +66,14 @@ interface CreatePersonArgs {
    *  INVALID_PHONE_NUMBER (see splitPhoneCallingCode below, which does
    *  the split). */
   phone: string
+  /** Email, quando a origem o fornece (formulário do site). Vai para o
+   *  composite `emails` do Twenty. */
+  email?: string | null
+  /** Origem do contacto (ex.: 'site_demo'). Só é escrita se o nome do
+   *  campo da Person no Twenty estiver em `TWENTY_PERSON_ORIGIN_FIELD`
+   *  (campo de texto/select já criado no Twenty); sem essa env a origem
+   *  não é enviada, para um nome de campo errado nunca partir o sync. */
+  origin?: string | null
 }
 
 /**
@@ -92,6 +105,8 @@ export async function createTwentyPerson(args: CreatePersonArgs): Promise<{ id: 
         primaryPhoneCallingCode: `+${callingCode}`,
         additionalPhones: [],
       },
+      ...(args.email ? { emails: { primaryEmail: args.email, additionalEmails: [] } } : {}),
+      ...(args.origin && originFieldName() ? { [originFieldName()!]: args.origin } : {}),
     }),
     signal: AbortSignal.timeout(10_000),
   })

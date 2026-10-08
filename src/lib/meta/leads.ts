@@ -184,7 +184,7 @@ async function markTemplateStatus(
   }
 }
 
-interface LeadContact {
+export interface LeadContact {
   id: string
   name: string
   phone: string
@@ -192,7 +192,7 @@ interface LeadContact {
   company: string | null
 }
 
-async function findOrCreateLeadContact(
+export async function findOrCreateLeadContact(
   db: SupabaseClient,
   accountId: string,
   userId: string,
@@ -295,7 +295,7 @@ async function findOrCreateLeadConversation(
  *  since submission and needs re-approval). Conservative: anything
  *  else is treated as a real failure, not silently swallowed as
  *  "pending approval". */
-function isTemplateNotReadyError(message: string): boolean {
+export function isTemplateNotReadyError(message: string): boolean {
   return /132001|132012|template.*(not found|does not exist|unavailable)/i.test(message)
 }
 

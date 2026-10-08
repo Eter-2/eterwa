@@ -30,6 +30,14 @@ import {
 } from './commercial'
 import { COMMERCIAL_TOOLS } from './tools/commercial-schema'
 import { createCommercialToolExecutor } from './tools/handlers/commercial'
+import {
+  DEMO_TOOLS,
+  buildDemoSystemPrompt,
+  createDemoToolExecutor,
+  effectiveMaxReplies,
+  isDemoConversation,
+  loadDemoContext,
+} from './demo'
 import type { GenerateResult } from './types'
 
 /** Base do link da conversa no EterWA, usado no aviso de handoff
@@ -114,7 +122,7 @@ export async function dispatchInboundToAiReply(
     if (conv.ai_autoreply_disabled) return // handed off / turned off here
     // Cheap early-out; the authoritative cap check is the atomic claim
     // below (this read can race a concurrent inbound).
-    if (conv.ai_reply_count >= config.autoReplyMaxPerConversation) return
+    if (conv.ai_reply_count >= effectiveMaxReplies(config.autoReplyMaxPerConversation, conv.source as string | null)) return
 
     // Bloco 3-A — commercial mode is now the DEFAULT persona for anyone
     // who writes, from an ad referral or directly, once the account
@@ -158,7 +166,15 @@ export async function dispatchInboundToAiReply(
     })
     if (!newNumberDecision.allowed) return
 
-    if (isCommercial) {
+    // Modo demo: conversa aberta por um pedido de demo no site
+    // (`source = 'site_demo'`, ver src/lib/meta/web-leads.ts). Variante
+    // do modo comercial, só aplicável a quem seria tratado como lead
+    // (os números da equipa continuam a apanhar o assistente interno).
+    const isDemo = isCommercial && isDemoConversation(conv.source as string | null)
+
+    // Sem a abertura fixa "Com quem estou a falar?" na demo: a pessoa já
+    // deu o nome no formulário e a conversa abriu com o template.
+    if (isCommercial && !isDemo) {
       // Sent FIRST, unconditionally, before any AI call — guarantees a
       // reply lands inside WhatsApp's 24h session window even if the AI
       // generation below is slow, times out, or fails outright. See
@@ -208,14 +224,24 @@ export async function dispatchInboundToAiReply(
       latestUserMessage(messages),
     )
 
-    const systemPrompt = buildSystemPrompt({
-      userPrompt: isCommercial ? config.commercialSystemPrompt ?? null : config.systemPrompt,
-      mode: isCommercial ? 'commercial_reply' : 'auto_reply',
-      knowledge,
-      commercialBookingUrl: isCommercial ? config.commercialBookingUrl : undefined,
-      commercialCalendarConfigured: isCommercial ? !!config.commercialCalendarId : undefined,
-      teamAlreadyRequested: isCommercial ? !!conv.team_requested_at : undefined,
-    })
+    const systemPrompt = isDemo
+      ? buildDemoSystemPrompt({
+          leadName: contactRow?.name ?? null,
+          company: contactRow?.company ?? null,
+          ...(await demoPromptContext(db, conversationId)),
+          calendarConfigured: !!config.commercialCalendarId,
+          bookingUrl: config.commercialBookingUrl,
+          teamAlreadyRequested: !!conv.team_requested_at,
+          knowledge,
+        })
+      : buildSystemPrompt({
+          userPrompt: isCommercial ? config.commercialSystemPrompt ?? null : config.systemPrompt,
+          mode: isCommercial ? 'commercial_reply' : 'auto_reply',
+          knowledge,
+          commercialBookingUrl: isCommercial ? config.commercialBookingUrl : undefined,
+          commercialCalendarConfigured: isCommercial ? !!config.commercialCalendarId : undefined,
+          teamAlreadyRequested: isCommercial ? !!conv.team_requested_at : undefined,
+        })
 
     // The 24h-window guarantee (see sendCommercialWelcomeIfNeeded above)
     // extends to the substantive reply too: if the provider call throws
@@ -238,8 +264,8 @@ export async function dispatchInboundToAiReply(
           config,
           systemPrompt,
           messages,
-          tools: COMMERCIAL_TOOLS,
-          executor: createCommercialToolExecutor({
+          tools: isDemo ? DEMO_TOOLS : COMMERCIAL_TOOLS,
+          executor: (isDemo ? createDemoToolExecutor : createCommercialToolExecutor)({
             db,
             accountId,
             conversationId,
@@ -459,7 +485,7 @@ export async function dispatchInboundToAiReply(
       'claim_ai_reply_slot',
       {
         conversation_id: conversationId,
-        max_replies: config.autoReplyMaxPerConversation,
+        max_replies: effectiveMaxReplies(config.autoReplyMaxPerConversation, conv.source as string | null),
       },
     )
     if (claimErr) {
@@ -482,5 +508,18 @@ export async function dispatchInboundToAiReply(
     })
   } catch (err) {
     console.error('[ai auto-reply] dispatch failed:', err)
+  }
+}
+
+/** Contexto da lead para o prompt da demo (origem, nº de comerciais, estado). */
+async function demoPromptContext(
+  db: ReturnType<typeof supabaseAdmin>,
+  conversationId: string,
+) {
+  const context = await loadDemoContext(db, conversationId)
+  return {
+    context,
+    nComerciais: context.n_comerciais ?? null,
+    origem: context.origem ?? null,
   }
 }

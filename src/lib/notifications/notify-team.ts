@@ -62,6 +62,20 @@ export interface MeetingNotifyInput {
   eventUrl: string | null
 }
 
+export interface DemoLeadNotifyInput {
+  accountId: string
+  nome: string
+  empresa: string | null
+  nComerciais: string | null
+  source: string
+  phone: string | null
+  email: string | null
+  /** Estado do envio do template: sent | template_pendente | failed |
+   *  skipped_no_consent | skipped_no_phone. */
+  templateStatus: string
+  conversationUrl: string | null
+}
+
 export type NotifyChannelOutcome =
   | { sent: true; via: 'text' | 'template' | 'webhook' }
   | { sent: false; reason: string }
@@ -318,5 +332,58 @@ export async function notifyMeetingBooked(input: MeetingNotifyInput): Promise<No
     }),
   ])
 
+  return { mattermost, whatsapp }
+}
+
+const DEMO_STATUS_LABEL: Record<string, string> = {
+  sent: 'template enviado',
+  template_pendente: 'template ainda por aprovar, reenvia sozinho',
+  failed: 'falha no envio do template',
+  skipped_no_consent: 'sem consentimento WhatsApp, contactar por email',
+  skipped_no_phone: 'telefone inválido, contactar por email',
+}
+
+function buildDemoLeadMattermostText(input: DemoLeadNotifyInput): string {
+  const lines = [
+    ':sparkles: **Nova lead do site (demo da Vera)**',
+    `Nome: ${input.nome}`,
+    `Empresa: ${input.empresa ?? 'não indicada'}`,
+    `Nº de comerciais: ${input.nComerciais ?? 'não indicado'}`,
+    `Origem: ${input.source}`,
+    `Telefone: ${input.phone ?? 'desconhecido'}`,
+    `Email: ${input.email ?? 'desconhecido'}`,
+    `Estado: ${DEMO_STATUS_LABEL[input.templateStatus] ?? input.templateStatus}`,
+  ]
+  if (input.conversationUrl) lines.push('', `Conversa: ${input.conversationUrl}`)
+  return lines.join('\n')
+}
+
+function buildDemoLeadWhatsAppText(input: DemoLeadNotifyInput): string {
+  const parts = [
+    `Nova lead do site: ${input.nome}`,
+    input.empresa ? `(${input.empresa})` : null,
+    input.nComerciais ? `${input.nComerciais} comerciais` : null,
+    DEMO_STATUS_LABEL[input.templateStatus] ?? input.templateStatus,
+  ].filter(Boolean)
+  return parts.join(', ')
+}
+
+/**
+ * Avisa a equipa (Mattermost + WhatsApp) de uma lead nova vinda do
+ * site. Best-effort nos dois canais, nunca lança. O texto de WhatsApp
+ * leva só o essencial (sem email nem telefone) porque vai como texto
+ * livre ou como parâmetro do template de alerta.
+ */
+export async function notifyDemoLead(input: DemoLeadNotifyInput): Promise<NotifyTeamOutcome> {
+  const [mattermost, whatsapp] = await Promise.all([
+    postToMattermost(buildDemoLeadMattermostText(input)).catch((err) => {
+      console.error('[notify-team] erro inesperado a notificar Mattermost (lead do site):', err)
+      return { sent: false, reason: 'unexpected_error' } as NotifyChannelOutcome
+    }),
+    sendToConfiguredNumbers(input.accountId, buildDemoLeadWhatsAppText(input)).catch((err) => {
+      console.error('[notify-team] erro inesperado a notificar WhatsApp (lead do site):', err)
+      return [] as NotifyChannelOutcome[]
+    }),
+  ])
   return { mattermost, whatsapp }
 }

@@ -69,6 +69,12 @@ interface WhatsAppMessage {
     button_reply?: { id: string; title: string }
     list_reply?: { id: string; title: string; description?: string }
   }
+  /**
+   * Set (type 'button') when the customer taps a QUICK_REPLY button of a
+   * TEMPLATE we sent (ex.: "Olá" no eter_demo_web_v1). Diferente de
+   * `interactive`: aqui só vem o texto do botão e o payload.
+   */
+  button?: { text: string; payload?: string }
   /** Present when the customer swipe-replies to one of our messages. */
   context?: { id: string }
   /**
@@ -1233,6 +1239,12 @@ async function parseMessageContent(
 
     case 'reaction':
       return { ...empty, contentText: message.reaction?.emoji || null }
+
+    case 'button':
+      // Toque num botão QUICK_REPLY de um template: guarda o texto do
+      // botão como se a pessoa o tivesse escrito, para a IA e o inbox o
+      // lerem (antes caía em "[Unsupported message type: button]").
+      return { ...empty, contentText: message.button?.text || message.button?.payload || null }
 
     case 'interactive': {
       // The customer tapped a reply button or a list row on a message
