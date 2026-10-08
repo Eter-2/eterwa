@@ -2,6 +2,7 @@ import { createClient, type SupabaseClient } from '@supabase/supabase-js'
 import { sendTextMessage, sendTemplateMessage } from '@/lib/whatsapp/meta-api'
 import { decrypt } from '@/lib/whatsapp/encryption'
 import { sanitizePhoneForMeta, isValidE164, isOutsideSessionWindowError } from '@/lib/whatsapp/phone-utils'
+import { cleanField, safeForNotification } from '@/lib/meta/lead-sanitize'
 import { findApprovedTemplateByName } from '@/lib/eter/repo/message-templates.repo'
 
 // ============================================================
@@ -341,17 +342,19 @@ const DEMO_STATUS_LABEL: Record<string, string> = {
   failed: 'falha no envio do template',
   skipped_no_consent: 'sem consentimento WhatsApp, contactar por email',
   skipped_no_phone: 'telefone inválido, contactar por email',
+  skipped_existing_conversation: 'o contacto já tem uma conversa, contactar manualmente',
+  expired: 'template não aprovado a tempo, contactar a lead',
 }
 
 function buildDemoLeadMattermostText(input: DemoLeadNotifyInput): string {
   const lines = [
     ':sparkles: **Nova lead do site (demo da Vera)**',
-    `Nome: ${input.nome}`,
-    `Empresa: ${input.empresa ?? 'não indicada'}`,
-    `Nº de comerciais: ${input.nComerciais ?? 'não indicado'}`,
-    `Origem: ${input.source}`,
-    `Telefone: ${input.phone ?? 'desconhecido'}`,
-    `Email: ${input.email ?? 'desconhecido'}`,
+    `Nome: ${safeForNotification(input.nome)}`,
+    `Empresa: ${input.empresa ? safeForNotification(input.empresa) : 'não indicada'}`,
+    `Nº de comerciais: ${input.nComerciais ? safeForNotification(input.nComerciais, 40) : 'não indicado'}`,
+    `Origem: ${safeForNotification(input.source, 40)}`,
+    `Telefone: ${input.phone ? safeForNotification(input.phone, 20) : 'desconhecido'}`,
+    `Email: ${input.email ? safeForNotification(input.email, 120) : 'desconhecido'}`,
     `Estado: ${DEMO_STATUS_LABEL[input.templateStatus] ?? input.templateStatus}`,
   ]
   if (input.conversationUrl) lines.push('', `Conversa: ${input.conversationUrl}`)
@@ -360,9 +363,9 @@ function buildDemoLeadMattermostText(input: DemoLeadNotifyInput): string {
 
 function buildDemoLeadWhatsAppText(input: DemoLeadNotifyInput): string {
   const parts = [
-    `Nova lead do site: ${input.nome}`,
-    input.empresa ? `(${input.empresa})` : null,
-    input.nComerciais ? `${input.nComerciais} comerciais` : null,
+    `Nova lead do site: ${cleanField(input.nome)}`,
+    input.empresa ? `(${cleanField(input.empresa)})` : null,
+    input.nComerciais ? `${cleanField(input.nComerciais, 40)} comerciais` : null,
     DEMO_STATUS_LABEL[input.templateStatus] ?? input.templateStatus,
   ].filter(Boolean)
   return parts.join(', ')

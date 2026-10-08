@@ -54,8 +54,9 @@ ficheiros `.env*`); acrescentar `LEADS_WEB_KEY=` lá à mão.
 
 | Variável | Obrigatória | Para quê |
 |---|---|---|
-| `LEADS_WEB_KEY` | sim | Chave partilhada com o servidor do site (header `X-Lead-Key`). Sem ela o endpoint responde 503. `openssl rand -hex 32`. O site guarda o mesmo valor no `.env` do seu servidor. |
+| `LEADS_WEB_KEY` | sim | Chave partilhada com o servidor do site (header `X-Lead-Key`), mínimo 32 bytes. Sem ela, ou mais curta, o endpoint responde 503. `openssl rand -hex 32`. O site guarda o mesmo valor no `.env` do seu servidor. |
 | `LEADS_WEB_ACCOUNT_ID` | não | Conta dona do número da Vera. Sem isto só é aceite se existir exactamente uma `whatsapp_config`. |
+| `DEMO_MAX_REPLIES` | não | Tecto de respostas da IA numa conversa de demo (por omissão 40, independente do tecto da conta). Ao atingi-lo, a Vera avisa a lead e chama a equipa. |
 | `DEMO_TEMPLATE_NAME` | não | Nome do template de abertura. Por omissão `eter_demo_web_v1`. |
 | `TWENTY_PERSON_ORIGIN_FIELD` | não | Nome do campo da Person no Twenty onde gravar a origem `site_demo`. Sem isto a origem não vai para o Twenty (fica em `web_leads` e na conversa). |
 | `MATTERMOST_WEBHOOK_URL`, `ai_configs.notify_phone_numbers` | já existem | Avisos da lead nova ao Ricardo (mesmo canal dos handoffs). |
@@ -69,9 +70,11 @@ Migração a aplicar **antes** do deploy: `supabase/migrations/060_site_demo.sql
 **servidor** do site, nunca pelo browser (a chave não pode ir para o
 cliente).
 
-Headers: `Content-Type: application/json`, `X-Lead-Key: <LEADS_WEB_KEY>`,
-e opcionalmente `X-Forwarded-For: <ip do visitante>` (rate limit por IP,
-30/min; global 120/min).
+Headers: `Content-Type: application/json`, `X-Lead-Key: <LEADS_WEB_KEY>`.
+O rate limit usa o IP que o nginx do EterWA vê (`X-Real-IP`, que o nginx
+sobrescreve), nunca cabeçalhos do cliente: 30 pedidos/min por IP, 120/min
+global, e 10 falhas de chave num minuto bloqueiam o IP (429). Tecto de
+100 leads/24 h por conta e 1 por telefone/24 h.
 
 ```json
 {
@@ -82,6 +85,10 @@ e opcionalmente `X-Forwarded-For: <ip do visitante>` (rate limit por IP,
   "n_comerciais": "3-5",
   "source": "lp-vera-whatsapp",
   "consentimento_whatsapp": true,
+  "consentimento_texto": "Aceito ser contactado por WhatsApp sobre a demonstração da Vera.",
+  "pagina_url": "https://etergrowth.com/agente-whatsapp",
+  "user_agent": "<user agent do visitante>",
+  "ip_visitante": "<ip do visitante>",
   "utm": { "utm_source": "linkedin", "utm_campaign": "vera" },
   "event_id": "evt_abc123"
 }
@@ -89,7 +96,12 @@ e opcionalmente `X-Forwarded-For: <ip do visitante>` (rate limit por IP,
 
 - Obrigatórios: `nome`, `telefone`, `email`, `empresa`, `source`
   (`lp-vera-whatsapp` ou `lp-vera-linkedin`), `consentimento_whatsapp`
-  (boolean, presente). Opcionais: `n_comerciais` (texto, ex. `1-2`, `3-5`,
+  (boolean, presente). Com `consentimento_whatsapp: true` são também
+  obrigatórios `consentimento_texto` (o texto exacto da checkbox) e
+  `pagina_url`; ficam guardados com a data, o `user_agent`, o
+  `ip_visitante` (opcionais, enviados pelo servidor do site) e o IP do
+  pedido, como prova de consentimento. Nenhum campo de texto pode ter
+  quebras de linha nem caracteres de controlo (400). Opcionais: `n_comerciais` (texto, ex. `1-2`, `3-5`,
   `6-10`, `Mais de 10`), `utm` (até 20 chaves), `event_id`.
 - Telefone: 9 dígitos portugueses ganham o indicativo 351; `+351...` e
   `00351...` também servem.
@@ -104,12 +116,13 @@ Respostas:
 | 200 | `{"ok":true,"status":"template_pendente"}` | Template ainda não aprovado pela Meta; reenvia sozinho (cron) quando for. |
 | 200 | `{"ok":true,"status":"skipped_no_consent"}` | `consentimento_whatsapp: false`: registada, nada enviado, o Ricardo é avisado para contactar por email. |
 | 200 | `{"ok":true,"status":"duplicate"}` | Já recebida. |
+| 200 | `{"ok":true,"status":"skipped_existing_conversation"}` | O contacto já tem uma conversa que não é uma demo (ou tem agente humano): não se converte, a equipa é avisada. |
 | 200 | `{"ok":true,"status":"failed"}` | Registada, mas o envio falhou (ver `web_leads.template_error`). |
 | 400 | `{"error":"Validation failed","issues":[...]}` | Corpo inválido (só caminhos, nunca os valores). |
 | 401 | | Chave em falta ou errada. |
 | 413 | | Corpo > 8 KB. |
 | 422 | `{"status":"invalid_phone"}` | Telefone inutilizável (registada, nada enviado). |
-| 429 | | Rate limit. |
+| 429 | | Rate limit, IP bloqueado por falhas de chave, ou tecto diário de leads. |
 | 503 | | `LEADS_WEB_KEY` não definida ou conta não resolvida. |
 
 ### Template `eter_demo_web_v1`

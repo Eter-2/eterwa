@@ -122,7 +122,24 @@ export async function dispatchInboundToAiReply(
     if (conv.ai_autoreply_disabled) return // handed off / turned off here
     // Cheap early-out; the authoritative cap check is the atomic claim
     // below (this read can race a concurrent inbound).
-    if (conv.ai_reply_count >= effectiveMaxReplies(config.autoReplyMaxPerConversation, conv.source as string | null)) return
+    if (
+      conv.ai_reply_count >=
+      effectiveMaxReplies(config.autoReplyMaxPerConversation, conv.source as string | null)
+    ) {
+      // Demo que chegou ao tecto: não fica em silêncio, passa à equipa.
+      if (isDemoConversation(conv.source as string | null) && !conv.team_requested_at) {
+        await handoffDemoAtCap({
+          db,
+          accountId,
+          conversationId,
+          contactId,
+          configOwnerUserId,
+          handoffMessage: config.handoffMessage,
+          replyCount: conv.ai_reply_count ?? 0,
+        })
+      }
+      return
+    }
 
     // Bloco 3-A — commercial mode is now the DEFAULT persona for anyone
     // who writes, from an ad referral or directly, once the account
@@ -228,7 +245,7 @@ export async function dispatchInboundToAiReply(
       ? buildDemoSystemPrompt({
           leadName: contactRow?.name ?? null,
           company: contactRow?.company ?? null,
-          ...(await demoPromptContext(db, conversationId)),
+          ...(await demoPromptContext(db, conversationId, accountId)),
           calendarConfigured: !!config.commercialCalendarId,
           bookingUrl: config.commercialBookingUrl,
           teamAlreadyRequested: !!conv.team_requested_at,
@@ -515,11 +532,66 @@ export async function dispatchInboundToAiReply(
 async function demoPromptContext(
   db: ReturnType<typeof supabaseAdmin>,
   conversationId: string,
+  accountId: string,
 ) {
-  const context = await loadDemoContext(db, conversationId)
+  const context = await loadDemoContext(db, conversationId, accountId)
   return {
     context,
     nComerciais: context.n_comerciais ?? null,
     origem: context.origem ?? null,
+  }
+}
+
+/**
+ * A demo atingiu o tecto de respostas da IA: avisa a lead, marca a equipa
+ * como chamada (a Vera pára de responder por tecto, mas o Ricardo é
+ * avisado) e notifica a equipa. Best-effort, nunca lança.
+ */
+async function handoffDemoAtCap(args: {
+  db: ReturnType<typeof supabaseAdmin>
+  accountId: string
+  conversationId: string
+  contactId: string
+  configOwnerUserId: string
+  handoffMessage: string | null | undefined
+  replyCount: number
+}): Promise<void> {
+  const { db, accountId, conversationId, contactId, configOwnerUserId } = args
+  try {
+    const { data: claimed, error } = await db
+      .from('conversations')
+      .update({ team_requested_at: new Date().toISOString() })
+      .eq('id', conversationId)
+      .eq('account_id', accountId)
+      .is('team_requested_at', null)
+      .select('id')
+    if (error || !claimed || claimed.length === 0) return // perdeu a corrida ou erro
+
+    await sendHandoffNotice({
+      accountId,
+      conversationId,
+      contactId,
+      configOwnerUserId,
+      handoffMessage: args.handoffMessage,
+    })
+    const { data: contact } = await db
+      .from('contacts')
+      .select('phone, name, email, company')
+      .eq('id', contactId)
+      .maybeSingle()
+    const messages = await buildConversationContext(db, conversationId)
+    void notifyHandoff({
+      accountId,
+      conversationId,
+      contactName: contact?.name ?? null,
+      company: contact?.company ?? null,
+      phone: contact?.phone ?? null,
+      email: contact?.email ?? null,
+      reason: 'A demo da Vera atingiu o limite de respostas automáticas.',
+      lastMessages: messages.slice(-3),
+      conversationUrl: `${ETERWA_INBOX_URL}?c=${encodeURIComponent(conversationId)}`,
+    }).catch((err) => console.error('[ai auto-reply] demo: notifyHandoff falhou:', err))
+  } catch (err) {
+    console.error('[ai auto-reply] demo: handoff no tecto falhou:', err instanceof Error ? err.message : err)
   }
 }

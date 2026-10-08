@@ -15,6 +15,8 @@ vi.mock('@/lib/notifications/notify-team', () => ({
 }))
 
 import {
+  RETRY_MAX_ATTEMPTS,
+  WEB_LEAD_DAILY_CAP,
   normalizeWebPhone,
   processWebLead,
   resolveWebLeadAccount,
@@ -33,6 +35,10 @@ const INPUT: WebLeadInput = {
   n_comerciais: '3-5',
   source: 'lp-vera-whatsapp',
   consentimento_whatsapp: true,
+  consentimento_texto: 'Aceito ser contactado por WhatsApp sobre a demonstração da Vera.',
+  pagina_url: 'https://etergrowth.com/agente-whatsapp',
+  user_agent: 'Mozilla/5.0 (teste)',
+  ip_visitante: '203.0.113.7',
   utm: { utm_source: 'linkedin' },
 }
 
@@ -139,6 +145,10 @@ describe('processWebLead', () => {
     expect(lead).toMatchObject({
       template_status: 'sent',
       template_message_id: 'wamid.1',
+      consent_text: INPUT.consentimento_texto,
+      consent_url: INPUT.pagina_url,
+      consent_user_agent: INPUT.user_agent,
+      consent_visitor_ip: '203.0.113.7',
       telefone: '351912345678',
       contact_id: contact.id,
       conversation_id: conv.id,
@@ -235,7 +245,7 @@ describe('processWebLead', () => {
     expect(result.templateStatus).toBe('failed')
   })
 
-  it('conversa existente de outra origem passa a site_demo', async () => {
+  it('conversa existente VAZIA de outra origem passa a site_demo', async () => {
     db.tables.contacts.push({ id: 'c-1', account_id: 'acct-1', phone: '351912345678', name: 'Duarte' })
     db.tables.conversations.push({ id: 'cv-1', account_id: 'acct-1', contact_id: 'c-1', source: 'direct' })
 
@@ -243,52 +253,283 @@ describe('processWebLead', () => {
 
     expect(db.tables.conversations).toHaveLength(1)
     expect(db.tables.conversations[0].source).toBe('site_demo')
+    expect(engineSendTemplateMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('conversa existente com histórico NÃO é convertida: não envia e avisa a equipa', async () => {
+    db.tables.contacts.push({ id: 'c-1', account_id: 'acct-1', phone: '351912345678', name: 'Duarte' })
+    db.tables.conversations.push({ id: 'cv-1', account_id: 'acct-1', contact_id: 'c-1', source: 'direct' })
+    db.tables.messages = [{ id: 'm-1', conversation_id: 'cv-1' }]
+
+    const result = await processWebLead(db.client, ACCOUNT, INPUT)
+
+    expect(result.templateStatus).toBe('skipped_existing_conversation')
+    expect(db.tables.conversations[0].source).toBe('direct')
+    expect(engineSendTemplateMock).not.toHaveBeenCalled()
+    expect(db.tables.web_leads[0]).toMatchObject({ dedupe_key: null })
+    await result.background?.()
+    expect(notifyDemoLeadMock).toHaveBeenCalledWith(
+      expect.objectContaining({ templateStatus: 'skipped_existing_conversation' }),
+    )
+  })
+
+  it('conversa com agente humano atribuído não é tocada', async () => {
+    db.tables.contacts.push({ id: 'c-1', account_id: 'acct-1', phone: '351912345678', name: 'Duarte' })
+    db.tables.conversations.push({
+      id: 'cv-1',
+      account_id: 'acct-1',
+      contact_id: 'c-1',
+      source: 'site_demo',
+      assigned_agent_id: 'agent-1',
+    })
+    const result = await processWebLead(db.client, ACCOUNT, INPUT)
+    expect(result.templateStatus).toBe('skipped_existing_conversation')
+    expect(engineSendTemplateMock).not.toHaveBeenCalled()
+  })
+
+  it('uma demo anterior é reposta: IA reactivada, contador e equipa a zero', async () => {
+    db.tables.contacts.push({ id: 'c-1', account_id: 'acct-1', phone: '351912345678', name: 'Duarte' })
+    db.tables.conversations.push({
+      id: 'cv-1',
+      account_id: 'acct-1',
+      contact_id: 'c-1',
+      source: 'site_demo',
+      ai_autoreply_disabled: true,
+      ai_reply_count: 33,
+      team_requested_at: '2026-10-01T10:00:00Z',
+      handoff_blocked_attempts: 2,
+    })
+    db.tables.messages = [{ id: 'm-1', conversation_id: 'cv-1' }]
+
+    const result = await processWebLead(db.client, ACCOUNT, INPUT)
+
+    expect(result.templateStatus).toBe('sent')
+    expect(db.tables.conversations[0]).toMatchObject({
+      ai_autoreply_disabled: false,
+      ai_reply_count: 0,
+      team_requested_at: null,
+      handoff_blocked_attempts: 0,
+    })
+  })
+
+  it('nunca sobrescreve o nome de um contacto existente', async () => {
+    db.tables.contacts.push({
+      id: 'c-1',
+      account_id: 'acct-1',
+      phone: '351912345678',
+      name: 'Nome Verdadeiro',
+      email: 'real@exemplo.pt',
+    })
+    await processWebLead(db.client, ACCOUNT, { ...INPUT, nome: 'Outro Nome' })
+    expect(db.tables.contacts[0].name).toBe('Nome Verdadeiro')
+    expect(db.tables.contacts[0].email).toBe('real@exemplo.pt')
+  })
+})
+
+describe('processWebLead: concorrência, tecto e dedupe', () => {
+  it('dois pedidos simultâneos para o mesmo telefone: só um envia', async () => {
+    const [a, b] = await Promise.all([
+      processWebLead(db.client, ACCOUNT, INPUT),
+      processWebLead(db.client, ACCOUNT, { ...INPUT, event_id: 'outro' }),
+    ])
+    expect([a.outcome, b.outcome].sort()).toEqual(['duplicate', 'processed'])
+    expect(engineSendTemplateMock).toHaveBeenCalledTimes(1)
+    expect(db.tables.web_leads).toHaveLength(1)
+  })
+
+  it('vários pedidos simultâneos (mesmo telefone) enviam uma única vez', async () => {
+    const results = await Promise.all(
+      Array.from({ length: 8 }, () => processWebLead(db.client, ACCOUNT, INPUT)),
+    )
+    expect(results.filter((r) => r.outcome === 'processed')).toHaveLength(1)
+    expect(engineSendTemplateMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('um envio falhado liberta o telefone para um novo pedido', async () => {
+    engineSendTemplateMock.mockRejectedValueOnce(new Error('Meta API error: 500'))
+    const first = await processWebLead(db.client, ACCOUNT, INPUT)
+    expect(first.templateStatus).toBe('failed')
+    expect(db.tables.web_leads[0].dedupe_key).toBeNull()
+
+    const second = await processWebLead(db.client, ACCOUNT, INPUT)
+    expect(second.outcome).toBe('processed')
+    expect(second.templateStatus).toBe('sent')
+  })
+
+  it('um pedido sem consentimento não bloqueia o telefone', async () => {
+    await processWebLead(db.client, ACCOUNT, { ...INPUT, consentimento_whatsapp: false })
+    const again = await processWebLead(db.client, ACCOUNT, INPUT)
+    expect(again.templateStatus).toBe('sent')
+  })
+
+  it('tecto diário por conta: a lead 101 é recusada', async () => {
+    const recent = new Date().toISOString()
+    for (let i = 0; i < WEB_LEAD_DAILY_CAP; i++) {
+      db.tables.web_leads.push({
+        id: `wl-${i}`,
+        account_id: 'acct-1',
+        telefone: `3519000${String(i).padStart(5, '0')}`,
+        template_status: 'sent',
+        created_at: recent,
+        updated_at: recent,
+      })
+    }
+    const result = await processWebLead(db.client, ACCOUNT, INPUT)
+    expect(result.outcome).toBe('rate_limited')
+    expect(engineSendTemplateMock).not.toHaveBeenCalled()
+    expect(db.tables.web_leads).toHaveLength(WEB_LEAD_DAILY_CAP)
+  })
+
+  it('o tecto diário só conta leads que ocupam telefone', async () => {
+    const recent = new Date().toISOString()
+    for (let i = 0; i < WEB_LEAD_DAILY_CAP; i++) {
+      db.tables.web_leads.push({
+        id: `wl-${i}`,
+        account_id: 'acct-1',
+        template_status: 'failed',
+        created_at: recent,
+        updated_at: recent,
+      })
+    }
+    expect((await processWebLead(db.client, ACCOUNT, INPUT)).outcome).toBe('processed')
+  })
+
+  it('o erro guardado e registado não contém telefones nem emails', async () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    engineSendTemplateMock.mockRejectedValue(
+      new Error('(#131030) Recipient 351912345678 duarte@exemplo.pt not allowed'),
+    )
+    await processWebLead(db.client, ACCOUNT, INPUT)
+    const stored = String(db.tables.web_leads[0].template_error)
+    expect(stored).not.toMatch(/351912345678|duarte@exemplo/)
+    expect(stored).toContain('***')
+    expect(JSON.stringify(spy.mock.calls)).not.toMatch(/351912345678|duarte@exemplo/)
+    spy.mockRestore()
+  })
+})
+
+describe('webLeadSchema: texto não confiável e consentimento', () => {
+  it('rejeita caracteres de controlo e quebras de linha em qualquer campo de texto', () => {
+    for (const field of ['nome', 'empresa', 'n_comerciais', 'telefone', 'event_id'] as const) {
+      for (const bad of ['a\nb', 'a\rb', 'a\u0000b', 'a\u2028b', 'a\tb']) {
+        expect(webLeadSchema.safeParse({ ...INPUT, [field]: bad }).success, `${field} ${JSON.stringify(bad)}`).toBe(false)
+      }
+    }
+    expect(webLeadSchema.safeParse({ ...INPUT, utm: { k: 'a\nb' } }).success).toBe(false)
+  })
+
+  it('com consentimento exige o texto e a página; sem consentimento não', () => {
+    const { consentimento_texto: _t, pagina_url: _p, ...semProva } = INPUT
+    void _t
+    void _p
+    expect(webLeadSchema.safeParse(semProva).success).toBe(false)
+    expect(webLeadSchema.safeParse({ ...semProva, consentimento_whatsapp: false }).success).toBe(true)
   })
 })
 
 describe('retryPendingWebLeads', () => {
+  const T0 = new Date('2026-10-08T10:00:00Z')
+  const after = (ms: number) => new Date(T0.getTime() + ms)
+  const MIN = 60 * 1000
+  const NOT_READY = new Error('(#132001) Template name does not exist')
+
   async function pendingLead() {
-    engineSendTemplateMock.mockRejectedValueOnce(new Error('(#132001) Template name does not exist'))
-    await processWebLead(db.client, ACCOUNT, INPUT)
+    engineSendTemplateMock.mockRejectedValueOnce(NOT_READY)
+    await processWebLead(db.client, ACCOUNT, INPUT, T0)
     expect(db.tables.web_leads[0].template_status).toBe('template_pendente')
-    engineSendTemplateMock.mockClear()
+    // O updated_at fictício acompanha o relógio do teste.
+    db.tables.web_leads[0].created_at = T0.toISOString()
+    db.tables.web_leads[0].updated_at = T0.toISOString()
+    engineSendTemplateMock.mockReset()
+    engineSendTemplateMock.mockResolvedValue({ whatsapp_message_id: 'wamid.2' })
   }
-  const later = () => new Date(Date.now() + 5 * 60 * 1000)
 
-  it('reenvia quando o template já está aprovado', async () => {
+  it('reenvia quando o template já está aprovado (depois de 5 min)', async () => {
     await pendingLead()
-
-    const out = await retryPendingWebLeads(db.client, later())
-
-    expect(out).toEqual({ sent: 1, stillPending: 0, failed: 0 })
+    const out = await retryPendingWebLeads(db.client, after(6 * MIN))
+    expect(out).toMatchObject({ sent: 1, stillPending: 0, failed: 0, expired: 0 })
     expect(db.tables.web_leads[0]).toMatchObject({ template_status: 'sent', template_attempts: 1 })
-    expect(engineSendTemplateMock).toHaveBeenCalledTimes(1)
     expect(engineSendTemplateMock.mock.calls[0][0]).toMatchObject({ params: ['Duarte'] })
   })
 
-  it('continua pendente enquanto o template não for aprovado', async () => {
+  it('respeita o backoff: nada antes de 5 min', async () => {
     await pendingLead()
-    engineSendTemplateMock.mockRejectedValue(new Error('(#132001) Template name does not exist'))
-
-    const out = await retryPendingWebLeads(db.client, later())
-
-    expect(out).toEqual({ sent: 0, stillPending: 1, failed: 0 })
-    expect(db.tables.web_leads[0].template_status).toBe('template_pendente')
+    expect(await retryPendingWebLeads(db.client, after(2 * MIN))).toMatchObject({ sent: 0 })
+    expect(engineSendTemplateMock).not.toHaveBeenCalled()
   })
 
-  it('não mexe em leads muito recentes (intervalo mínimo) nem em leads velhas', async () => {
+  it('continua pendente enquanto o template não for aprovado, com backoff crescente', async () => {
     await pendingLead()
-    expect(await retryPendingWebLeads(db.client, new Date())).toEqual({ sent: 0, stillPending: 0, failed: 0 })
+    engineSendTemplateMock.mockRejectedValue(NOT_READY)
 
-    const muitoDepois = new Date(Date.now() + 49 * 60 * 60 * 1000)
-    expect(await retryPendingWebLeads(db.client, muitoDepois)).toEqual({ sent: 0, stillPending: 0, failed: 0 })
+    let now = 6 * MIN
+    expect(await retryPendingWebLeads(db.client, after(now))).toMatchObject({ stillPending: 1 })
+    db.tables.web_leads[0].updated_at = after(now).toISOString()
+    // 2.ª tentativa só passados 15 min.
+    expect(await retryPendingWebLeads(db.client, after(now + 10 * MIN))).toMatchObject({ stillPending: 0 })
+    now += 16 * MIN
+    expect(await retryPendingWebLeads(db.client, after(now))).toMatchObject({ stillPending: 1 })
+    expect(db.tables.web_leads[0].template_attempts).toBe(2)
+  })
+
+  it('depois de 5 tentativas expira: failed e aviso à equipa', async () => {
+    await pendingLead()
+    db.tables.web_leads[0].template_attempts = RETRY_MAX_ATTEMPTS
+    db.tables.web_leads[0].updated_at = T0.toISOString()
+
+    const out = await retryPendingWebLeads(db.client, after(7 * 60 * MIN))
+
+    expect(out.expired).toBe(1)
+    expect(db.tables.web_leads[0]).toMatchObject({ template_status: 'failed', dedupe_key: null })
+    expect(notifyDemoLeadMock).toHaveBeenCalledWith(expect.objectContaining({ templateStatus: 'expired' }))
+    expect(engineSendTemplateMock).not.toHaveBeenCalled()
+  })
+
+  it('passadas 24 h expira mesmo com tentativas por gastar', async () => {
+    await pendingLead()
+    const out = await retryPendingWebLeads(db.client, after(25 * 60 * MIN))
+    expect(out.expired).toBe(1)
+    expect(engineSendTemplateMock).not.toHaveBeenCalled()
+  })
+
+  it('não reenvia se o template já tinha saído (idempotência)', async () => {
+    await pendingLead()
+    db.tables.messages = [
+      { id: 'm-1', conversation_id: db.tables.web_leads[0].conversation_id, template_name: 'eter_demo_web_v1' },
+    ]
+    const out = await retryPendingWebLeads(db.client, after(6 * MIN))
+    expect(out.sent).toBe(1)
     expect(engineSendTemplateMock).not.toHaveBeenCalled()
   })
 
   it('duas invocações seguidas não enviam duas vezes', async () => {
     await pendingLead()
-    await retryPendingWebLeads(db.client, later())
-    await retryPendingWebLeads(db.client, later())
+    await retryPendingWebLeads(db.client, after(6 * MIN))
+    await retryPendingWebLeads(db.client, after(7 * MIN))
     expect(engineSendTemplateMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('recolhe um envio preso em sending há mais de 10 min', async () => {
+    await pendingLead()
+    db.tables.web_leads[0].template_status = 'sending'
+    db.tables.web_leads[0].updated_at = T0.toISOString()
+
+    expect(await retryPendingWebLeads(db.client, after(5 * MIN))).toMatchObject({ sent: 0, failed: 0 })
+    expect(db.tables.web_leads[0].template_status).toBe('sending')
+
+    await retryPendingWebLeads(db.client, after(11 * MIN))
+    // Sem prova de envio: volta a template_pendente para o backoff tratar.
+    expect(db.tables.web_leads[0].template_status).toBe('template_pendente')
+  })
+
+  it('um envio preso mas já entregue fica sent', async () => {
+    await pendingLead()
+    db.tables.web_leads[0].template_status = 'sending'
+    db.tables.messages = [
+      { id: 'm-1', conversation_id: db.tables.web_leads[0].conversation_id, template_name: 'eter_demo_web_v1' },
+    ]
+    const out = await retryPendingWebLeads(db.client, after(11 * MIN))
+    expect(out.sent).toBe(1)
+    expect(db.tables.web_leads[0].template_status).toBe('sent')
   })
 })

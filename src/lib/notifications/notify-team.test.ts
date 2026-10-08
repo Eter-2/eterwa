@@ -208,3 +208,46 @@ describe('notifyMeetingBooked', () => {
     expect(result.whatsapp).toEqual([{ sent: true, via: 'text' }])
   })
 })
+
+describe('notifyDemoLead: campos do visitante não confiáveis', () => {
+  const EVIL = {
+    accountId: 'acct-1',
+    nome: '@all **Ana**\n[clica](http://mal.pt) `x`',
+    empresa: `Acme ${'A'.repeat(300)}`,
+    nComerciais: '3-5\n@channel',
+    source: 'lp-vera-whatsapp',
+    phone: '351912345678',
+    email: 'x@y.pt',
+    templateStatus: 'sent',
+    conversationUrl: null,
+  }
+
+  it('escapa markdown e @menções, tira quebras de linha e trunca', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200 })
+    global.fetch = fetchMock as unknown as typeof fetch
+
+    const { notifyDemoLead } = await import('./notify-team')
+    await notifyDemoLead(EVIL)
+
+    const text = JSON.parse(fetchMock.mock.calls[0][1].body as string).text as string
+    expect(text).not.toContain('@all')
+    expect(text).not.toContain('@channel')
+    expect(text).not.toContain('[clica](')
+    expect(text).not.toContain('**Ana**')
+    expect(text).not.toContain('`x`')
+    // Uma linha por campo: nenhum campo do visitante partiu o formato.
+    expect(text.split('\n').filter((l) => l.startsWith('Nome:'))).toHaveLength(1)
+    expect(text.split('\n').find((l) => l.startsWith('Empresa:'))!.length).toBeLessThan(120)
+  })
+
+  it('o texto de WhatsApp leva só o essencial, limpo e truncado', async () => {
+    global.fetch = vi.fn().mockResolvedValue({ ok: true, status: 200 }) as unknown as typeof fetch
+    const { notifyDemoLead } = await import('./notify-team')
+    await notifyDemoLead(EVIL)
+    const sent = h.sendTextMessage.mock.calls[0][0].text as string
+    expect(sent).not.toContain('\n')
+    expect(sent).not.toContain('351912345678')
+    expect(sent).not.toContain('x@y.pt')
+    expect(sent.length).toBeLessThan(300)
+  })
+})

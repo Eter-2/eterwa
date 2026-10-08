@@ -36,9 +36,12 @@ export function makeFakeDb(seed: Record<string, Row[]> = {}): FakeDb {
     const run = (): { data: Row[] | null; error: { code?: string; message: string } | null } => {
       const rows = tables[table] ?? (tables[table] = [])
       if (op === 'insert') {
-        if (table === 'web_leads' && payload.event_id) {
+        if (table === 'web_leads') {
           const dup = rows.some(
-            (r) => r.account_id === payload.account_id && r.event_id === payload.event_id,
+            (r) =>
+              r.account_id === payload.account_id &&
+              ((payload.event_id && r.event_id === payload.event_id) ||
+                (payload.dedupe_key && r.dedupe_key === payload.dedupe_key)),
           )
           if (dup) return { data: null, error: { code: '23505', message: 'duplicate key' } }
         }
@@ -77,6 +80,7 @@ export function makeFakeDb(seed: Record<string, Row[]> = {}): FakeDb {
       },
       eq: (col: string, val: unknown) => (filters.push((r) => r[col] === val), b),
       is: (col: string, val: unknown) => (filters.push((r) => (r[col] ?? null) === val), b),
+      in: (col: string, vals: unknown[]) => (filters.push((r) => vals.includes(r[col])), b),
       gte: (col: string, val: string) => (filters.push((r) => String(r[col]) >= val), b),
       lte: (col: string, val: string) => (filters.push((r) => String(r[col]) <= val), b),
       like: (col: string, pattern: string) => {

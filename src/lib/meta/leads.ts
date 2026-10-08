@@ -197,6 +197,7 @@ export async function findOrCreateLeadContact(
   accountId: string,
   userId: string,
   normalized: NormalizedLead,
+  opts: { updateName?: boolean } = {},
 ): Promise<LeadContact> {
   const phone = normalized.phone!
   const name = normalized.fullName || phone
@@ -204,7 +205,7 @@ export async function findOrCreateLeadContact(
   const existing = await findExistingContact(db, accountId, phone)
   if (existing) {
     const patch: Record<string, unknown> = {}
-    if (normalized.fullName && normalized.fullName !== existing.name) patch.name = normalized.fullName
+    if (opts.updateName !== false && normalized.fullName && normalized.fullName !== existing.name) patch.name = normalized.fullName
     if (normalized.email && !existing.email) patch.email = normalized.email
     if (normalized.company && !existing.company) patch.company = normalized.company
     if (Object.keys(patch).length > 0) {

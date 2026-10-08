@@ -124,13 +124,12 @@ vi.mock('./admin-client', () => ({
         }
       }
       // conversations
+      const convChain: Record<string, unknown> = {
+        eq: () => convChain,
+        maybeSingle: () => Promise.resolve({ data: h.state.conv, error: null }),
+      }
       return {
-        select: () => ({
-          eq: () => ({
-            maybeSingle: () =>
-              Promise.resolve({ data: h.state.conv, error: null }),
-          }),
-        }),
+        select: () => convChain,
         update: (payload: Record<string, unknown>) => {
           h.state.updatePayload = payload
           // Two call shapes land here:
@@ -1161,7 +1160,7 @@ describe('dispatchInboundToAiReply — modo demo (source site_demo)', () => {
     expect(h.generateReplyWithTools).toHaveBeenCalledTimes(1)
     const call = h.generateReplyWithTools.mock.calls[0][0] as { systemPrompt: string }
     expect(call.systemPrompt).toContain('demonstração AO VIVO')
-    expect(call.systemPrompt).toContain('Empresa: Acme Growth Lda')
+    expect(call.systemPrompt).toContain('"empresa":"Acme Growth Lda"')
     expect(call.systemPrompt).toContain('por "tu"')
     // O prompt comercial da conta não entra na demo.
     expect(call.systemPrompt).not.toContain('Somos a Acme Growth.')
@@ -1190,7 +1189,7 @@ describe('dispatchInboundToAiReply — modo demo (source site_demo)', () => {
     expect(call.systemPrompt).not.toContain('demonstração AO VIVO')
   })
 
-  it('o tecto de respostas da demo é mais alto que o da conta', async () => {
+  it('o tecto de respostas da demo é o da demo (40), não o da conta', async () => {
     h.state.conv = commercialConv({ source: 'site_demo', ai_reply_count: 10 })
     h.loadAiConfig.mockResolvedValue(commercialConfig({ autoReplyMaxPerConversation: 3 }))
 
@@ -1200,6 +1199,35 @@ describe('dispatchInboundToAiReply — modo demo (source site_demo)', () => {
     expect(h.state.rpcCalls.find((c) => c.name === 'claim_ai_reply_slot')?.args).toMatchObject({
       max_replies: 40,
     })
+  })
+
+  it('ao atingir o tecto da demo avisa a lead, chama a equipa e notifica (uma só vez)', async () => {
+    h.state.conv = commercialConv({ source: 'site_demo', ai_reply_count: 40, team_requested_at: null })
+    h.state.welcomeClaimed = true // o UPDATE condicional de team_requested_at ganha
+    h.loadAiConfig.mockResolvedValue(commercialConfig())
+
+    await dispatchInboundToAiReply(ARGS)
+
+    expect(h.generateReplyWithTools).not.toHaveBeenCalled()
+    expect(h.engineSendText).toHaveBeenCalledTimes(1) // o aviso de handoff
+    expect(h.notifyHandoff).toHaveBeenCalledTimes(1)
+    expect(h.notifyHandoff).toHaveBeenCalledWith(
+      expect.objectContaining({ reason: expect.stringContaining('limite de respostas') }),
+    )
+  })
+
+  it('no tecto da demo, se a equipa já foi chamada não repete o aviso', async () => {
+    h.state.conv = commercialConv({
+      source: 'site_demo',
+      ai_reply_count: 40,
+      team_requested_at: '2026-10-08T10:00:00Z',
+    })
+    h.loadAiConfig.mockResolvedValue(commercialConfig())
+
+    await dispatchInboundToAiReply(ARGS)
+
+    expect(h.engineSendText).not.toHaveBeenCalled()
+    expect(h.notifyHandoff).not.toHaveBeenCalled()
   })
 
   it('fora da demo o tecto da conta continua a valer', async () => {

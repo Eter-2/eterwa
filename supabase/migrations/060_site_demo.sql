@@ -40,6 +40,17 @@ CREATE TABLE IF NOT EXISTS web_leads (
   n_comerciais            text,
   utm                     jsonb,
   consentimento_whatsapp  boolean NOT NULL DEFAULT false,
+  -- Prova de consentimento (RGPD): o que o visitante viu e aceitou.
+  consent_at              timestamptz,
+  consent_text            text,
+  consent_url             text,
+  consent_user_agent      text,
+  consent_visitor_ip      text,
+  consent_request_ip      text,
+  -- Dedupe atómico: telefone + dia (UTC). Só as leads que ocupam o
+  -- telefone (pending, sending, sent, template_pendente) a têm; ao
+  -- falhar/saltar passa a NULL e o telefone fica livre. UNIQUE por conta.
+  dedupe_key              text,
   contact_id              uuid REFERENCES contacts(id) ON DELETE SET NULL,
   conversation_id         uuid REFERENCES conversations(id) ON DELETE SET NULL,
   -- Twenty person id (texto, sem FK, mesmo critério de meta_leads).
@@ -50,10 +61,14 @@ CREATE TABLE IF NOT EXISTS web_leads (
   -- failed              — erro inesperado no envio (ver template_error)
   -- skipped_no_consent  — sem consentimento WhatsApp
   -- skipped_no_phone    — telefone ausente ou inválido
+  -- skipped_existing_conversation — o contacto já tem uma conversa que não é
+  --                         uma demo (ou tem agente humano): não se converte
+  -- sending             — envio em curso (reservado); recolhido após 10 min
   template_status         text NOT NULL DEFAULT 'pending'
                              CHECK (template_status IN (
-                               'pending', 'sent', 'template_pendente',
-                               'failed', 'skipped_no_consent', 'skipped_no_phone'
+                               'pending', 'sending', 'sent', 'template_pendente',
+                               'failed', 'skipped_no_consent', 'skipped_no_phone',
+                               'skipped_existing_conversation'
                              )),
   template_name           text,
   template_message_id     text,
@@ -65,6 +80,8 @@ CREATE TABLE IF NOT EXISTS web_leads (
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_web_leads_event_id
   ON web_leads (account_id, event_id) WHERE event_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_web_leads_dedupe_key
+  ON web_leads (account_id, dedupe_key) WHERE dedupe_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_web_leads_account_id ON web_leads (account_id);
 CREATE INDEX IF NOT EXISTS idx_web_leads_telefone_created
   ON web_leads (account_id, telefone, created_at DESC) WHERE telefone IS NOT NULL;
@@ -72,6 +89,11 @@ CREATE INDEX IF NOT EXISTS idx_web_leads_template_status
   ON web_leads (template_status) WHERE template_status = 'template_pendente';
 
 ALTER TABLE web_leads ENABLE ROW LEVEL SECURITY;
+
+-- Só o service role escreve (o endpoint); membros da conta só leem; o
+-- papel anon não vê nada (contém PII e prova de consentimento).
+REVOKE ALL ON TABLE web_leads FROM anon;
+REVOKE INSERT, UPDATE, DELETE ON TABLE web_leads FROM authenticated;
 
 DROP POLICY IF EXISTS web_leads_select ON web_leads;
 CREATE POLICY web_leads_select ON web_leads FOR SELECT
