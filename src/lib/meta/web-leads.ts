@@ -25,7 +25,6 @@ import type { SupabaseClient } from '@supabase/supabase-js'
 import { parsePhoneNumberFromString } from 'libphonenumber-js/max'
 import { isUniqueViolation } from '@/lib/contacts/dedupe'
 import { engineSendTemplate } from '@/lib/automations/meta-send'
-import { syncWebLeadToCrm } from '@/lib/crm/sync'
 import { notifyDemoLead, notifyDemoCapWarning } from '@/lib/notifications/notify-team'
 import { firstNameForTemplate } from '@/lib/eter/followups'
 import { findOrCreateLeadContact, isTemplateNotReadyError, type NormalizedLead } from './leads'
@@ -664,16 +663,9 @@ export async function processWebLead(
       webLeadId,
       templateStatus,
       background: async () => {
-        await Promise.all([
-          syncWebLeadToCrm({
-            db,
-            accountId,
-            webLeadId,
-            contactId: contact.id,
-            email: input.email,
-          }),
-          notify(templateStatus, conversation.id),
-        ])
+        // O site é o dono da sincronização com o Twenty (upsert com dedupe),
+        // por isso o EterWA não cria Pessoas para leads do site.
+        await notify(templateStatus, conversation.id)
       },
     }
   } catch (err) {

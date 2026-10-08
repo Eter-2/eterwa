@@ -58,7 +58,7 @@ ficheiros `.env*`); acrescentar `LEADS_WEB_KEY=` lá à mão.
 | `LEADS_WEB_ACCOUNT_ID` | não | Conta dona do número da Vera. Sem isto só é aceite se existir exactamente uma `whatsapp_config`. |
 | `DEMO_MAX_REPLIES` | não | Tecto de respostas da IA numa conversa de demo (por omissão 40, independente do tecto da conta). Ao atingi-lo, a Vera avisa a lead e chama a equipa. |
 | `DEMO_TEMPLATE_NAME` | não | Nome do template de abertura. Por omissão `eter_demo_web_v1`. |
-| `TWENTY_PERSON_ORIGIN_FIELD` | não | Nome do campo da Person no Twenty onde gravar a origem `site_demo`. Sem isto a origem não vai para o Twenty (fica em `web_leads` e na conversa). |
+| `TWENTY_PERSON_ORIGIN_FIELD` | não | Já não é usada pelas leads do site: o site é o dono da sincronização com o Twenty (o EterWA não cria Pessoas para `site_demo`). |
 | `MATTERMOST_WEBHOOK_URL`, `ai_configs.notify_phone_numbers` | já existem | Avisos da lead nova ao Ricardo (mesmo canal dos handoffs). |
 
 Migração a aplicar **antes** do deploy: `supabase/migrations/060_site_demo.sql`

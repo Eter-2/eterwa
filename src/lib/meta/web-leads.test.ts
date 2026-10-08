@@ -5,9 +5,10 @@ const engineSendTemplateMock = vi.fn()
 vi.mock('@/lib/automations/meta-send', () => ({
   engineSendTemplate: (...args: unknown[]) => engineSendTemplateMock(...args),
 }))
-const syncWebLeadToCrmMock = vi.fn().mockResolvedValue(undefined)
+const crmSyncMock = vi.fn()
 vi.mock('@/lib/crm/sync', () => ({
-  syncWebLeadToCrm: (...args: unknown[]) => syncWebLeadToCrmMock(...args),
+  syncMetaAdLeadToCrm: (...args: unknown[]) => crmSyncMock(...args),
+  syncMetaLeadToCrm: (...args: unknown[]) => crmSyncMock(...args),
 }))
 const notifyDemoLeadMock = vi.fn().mockResolvedValue({ mattermost: { sent: true, via: 'webhook' }, whatsapp: [] })
 const notifyCapWarningMock = vi.fn().mockResolvedValue(undefined)
@@ -54,7 +55,7 @@ beforeEach(() => {
   engineSendTemplateMock.mockResolvedValue({ whatsapp_message_id: 'wamid.1' })
   notifyDemoLeadMock.mockClear()
   notifyCapWarningMock.mockClear()
-  syncWebLeadToCrmMock.mockClear()
+  crmSyncMock.mockClear()
 })
 
 describe('normalizeWebPhone', () => {
@@ -164,12 +165,11 @@ describe('processWebLead', () => {
       conversation_id: conv.id,
     })
 
-    // Twenty e aviso à equipa correm em background, depois da resposta.
-    expect(syncWebLeadToCrmMock).not.toHaveBeenCalled()
+    // O aviso à equipa corre em background; o EterWA NÃO sincroniza leads
+    // do site com o Twenty (o site é o dono dessa sincronização).
     await result.background?.()
-    expect(syncWebLeadToCrmMock).toHaveBeenCalledWith(
-      expect.objectContaining({ webLeadId: lead.id, contactId: contact.id, email: 'duarte@exemplo.pt' }),
-    )
+    expect(crmSyncMock).not.toHaveBeenCalled()
+    expect(lead.crm_person_id).toBeUndefined()
     expect(notifyDemoLeadMock).toHaveBeenCalledWith(
       expect.objectContaining({ nome: 'Duarte Silva', empresa: 'Plásticos do Norte', templateStatus: 'sent' }),
     )
@@ -223,7 +223,7 @@ describe('processWebLead', () => {
     expect(notifyDemoLeadMock).toHaveBeenCalledWith(
       expect.objectContaining({ templateStatus: 'skipped_no_consent' }),
     )
-    expect(syncWebLeadToCrmMock).not.toHaveBeenCalled()
+    expect(crmSyncMock).not.toHaveBeenCalled()
   })
 
   it('telefone inválido: regista skipped_no_phone e não envia', async () => {
