@@ -14,6 +14,7 @@ import { findApprovedTemplateByName } from '@/lib/eter/repo/message-templates.re
 import { isWithinSessionWindow } from '@/lib/eter/session-window'
 import { engineSendText, engineSendTemplate } from '@/lib/automations/meta-send'
 import { firstNameForTemplate, type ScheduledTemplatePayload } from '@/lib/eter/followups'
+import { retryPendingWebLeads } from '@/lib/meta/web-leads'
 
 /**
  * Drain due `agent_scheduled_messages` rows — the quiet-lead follow-up
@@ -61,6 +62,15 @@ export async function GET(request: Request) {
     console.error('[eter-agent-cron] reclaimStaleProcessingMessages failed:', err)
     return 0
   })
+
+  // Leads do site cujo template (eter_demo_web_v1) ainda não estava
+  // aprovado quando entraram: reenvia as que já podem sair. Nunca lança.
+  const webLeads = await retryPendingWebLeads(admin)
+  if (webLeads.sent + webLeads.stillPending + webLeads.failed > 0) {
+    console.log(
+      `[eter-agent-cron] leads do site: ${webLeads.sent} enviadas, ${webLeads.stillPending} ainda sem template aprovado, ${webLeads.failed} falhadas.`,
+    )
+  }
 
   const due = await getDueScheduledMessages(admin, { limit: 50 })
   if (due.length === 0) return NextResponse.json({ sent: 0, failed: 0, skipped: 0, reclaimed })

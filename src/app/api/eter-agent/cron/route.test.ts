@@ -45,6 +45,10 @@ vi.mock('@/lib/automations/meta-send', () => ({
   engineSendTemplate: h.engineSendTemplate,
 }))
 
+vi.mock('@/lib/meta/web-leads', () => ({
+  retryPendingWebLeads: vi.fn().mockResolvedValue({ sent: 0, stillPending: 0, failed: 0 }),
+}))
+
 import { GET } from './route'
 
 const SECRET = 'test-cron-secret'
